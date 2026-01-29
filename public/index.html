@@ -2,43 +2,181 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Bitrix24 Live Wallboard</title>
+  <title>Live Call Wallboard</title>
   <style>
     body { font-family: Arial, sans-serif; background:#0b1220; color:#e6eefc; margin:20px; }
-    .grid { display:grid; grid-template-columns: repeat(2, minmax(240px, 1fr)); gap:16px; max-width:900px; }
-    .tile { background:#121b2f; border:1px solid #223055; border-radius:12px; padding:18px; }
-    .label { opacity:.8; font-size:14px; }
-    .value { font-size:46px; margin-top:8px; }
+    h2 { margin: 0 0 14px 0; }
+    .grid { display:grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap:14px; max-width:1200px; }
+    .tile { background:#121b2f; border:1px solid #223055; border-radius:12px; padding:16px; }
+    .label { opacity:.85; font-size:13px; }
+    .value { font-size:36px; margin-top:6px; }
+    .sub { opacity:.85; font-size:14px; margin-top:8px; display:flex; gap:12px; flex-wrap:wrap; }
+    .pill { background:#0d1a33; border:1px solid #223055; padding:6px 10px; border-radius:999px; }
+    .section { margin-top:18px; max-width:1200px; display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
+    .panel { background:#121b2f; border:1px solid #223055; border-radius:12px; padding:16px; }
+    table { width:100%; border-collapse:collapse; font-size:14px; }
+    th, td { border-bottom: 1px solid #223055; padding:10px 8px; text-align:left; }
+    th { opacity:.85; font-size:13px; }
+    .oncall { font-weight:700; }
+    .muted { opacity:.8; font-size:12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
   </style>
 </head>
 <body>
-  <h2>📞 Live Now Wallboard</h2>
+
+  <h2>📞 Live Call Wallboard (Live Now)</h2>
+  <div class="muted">Auto-updates in real-time. If you refresh, it reconnects automatically.</div>
 
   <div class="grid">
     <div class="tile">
-      <div class="label">Inbound Ringing (Now)</div>
-      <div class="value" id="ringing">0</div>
+      <div class="label">Incoming Calls</div>
+      <div class="value" id="in_inprog">0</div>
+      <div class="sub">
+        <span class="pill">Missed: <b id="in_missed">0</b></span>
+        <span class="pill">Cancelled: <b id="in_cancel">0</b></span>
+      </div>
+      <div class="muted">(Cancelled is usually 0 for inbound; used if your payload provides it later.)</div>
     </div>
 
     <div class="tile">
-      <div class="label">Missed (Today)</div>
-      <div class="value" id="missed">0</div>
+      <div class="label">Outgoing Calls</div>
+      <div class="value" id="out_inprog">0</div>
+      <div class="sub">
+        <span class="pill">Missed: <b id="out_missed">0</b></span>
+        <span class="pill">Cancelled: <b id="out_cancel">0</b></span>
+      </div>
+    </div>
+
+    <div class="tile">
+      <div class="label">Missed / Dropped / Abandoned (Today)</div>
+      <div class="value" id="mda">0</div>
+      <div class="sub">
+        <span class="pill">Agents On Call Now: <b id="agents_oncall">0</b></span>
+      </div>
     </div>
   </div>
 
-  <script>
-    const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${wsProto}//${location.host}`);
+  <div class="section">
+    <div class="panel">
+      <h3 style="margin:0 0 10px 0;">👥 Agent Productivity (Today)</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Agent ID</th>
+            <th>Status</th>
+            <th>Inbound</th>
+            <th>Outbound</th>
+            <th>Talk Time</th>
+          </tr>
+        </thead>
+        <tbody id="agents_tbody"></tbody>
+      </table>
+      <div class="muted">Agent names can be added next (Bitrix user lookup). For now it shows Agent ID.</div>
+    </div>
 
-    function render(m) {
-      document.getElementById("ringing").textContent = m.inboundRinging ?? 0;
-      document.getElementById("missed").textContent  = m.missedToday ?? 0;
+    <div class="panel">
+      <h3 style="margin:0 0 10px 0;">☎️ Live Calls (Now)</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Call</th>
+            <th>Dir</th>
+            <th>Agent</th>
+            <th>From</th>
+            <th>To</th>
+            <th>Started</th>
+          </tr>
+        </thead>
+        <tbody id="calls_tbody"></tbody>
+      </table>
+      <div class="muted">Shows current calls still “in progress” (ringing / active).</div>
+    </div>
+  </div>
+
+<script>
+  const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${wsProto}//${location.host}`);
+
+  function fmtTimeAgo(ms) {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + "m";
+    const h = Math.floor(m / 60);
+    return h + "h";
+  }
+
+  function fmtTalk(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}m ${s}s`;
+  }
+
+  function setText(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  }
+
+  function render(data) {
+    const m = data.metrics || {};
+    const incoming = m.incoming || {};
+    const outgoing = m.outgoing || {};
+
+    setText("in_inprog", incoming.inProgress ?? 0);
+    setText("in_missed", incoming.missed ?? 0);
+    setText("in_cancel", incoming.cancelled ?? 0);
+
+    setText("out_inprog", outgoing.inProgress ?? 0);
+    setText("out_missed", outgoing.missed ?? 0);
+    setText("out_cancel", outgoing.cancelled ?? 0);
+
+    setText("mda", m.missedDroppedAbandoned ?? 0);
+    setText("agents_oncall", m.activeAgentsOnCall ?? 0);
+
+    // Agents table
+    const agents = data.agents || [];
+    const at = document.getElementById("agents_tbody");
+    at.innerHTML = "";
+
+    for (const a of agents) {
+      const tr = document.createElement("tr");
+      const status = a.onCallNow ? "ON CALL" : "AVAILABLE";
+      tr.innerHTML = `
+        <td class="mono">${a.agentId ?? ""}</td>
+        <td class="${a.onCallNow ? "oncall" : ""}">${status}</td>
+        <td>${(a.inboundHandled ?? 0)} / missed ${(a.inboundMissed ?? 0)}</td>
+        <td>${(a.outboundHandled ?? 0)} / missed ${(a.outboundMissed ?? 0)}</td>
+        <td>${fmtTalk(a.talkSeconds ?? 0)}</td>
+      `;
+      at.appendChild(tr);
     }
 
-    ws.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      if (data.metrics) render(data.metrics);
-    };
-  </script>
+    // Live calls table
+    const calls = data.liveCalls || [];
+    const ct = document.getElementById("calls_tbody");
+    ct.innerHTML = "";
+
+    for (const c of calls) {
+      const tr = document.createElement("tr");
+      const age = c.startedAt ? fmtTimeAgo(Date.now() - c.startedAt) : "";
+      tr.innerHTML = `
+        <td class="mono">${c.callId ?? ""}</td>
+        <td>${c.direction ?? ""}</td>
+        <td class="mono">${c.agentId ?? ""}</td>
+        <td>${c.from ?? ""}</td>
+        <td>${c.to ?? ""}</td>
+        <td>${age}</td>
+      `;
+      ct.appendChild(tr);
+    }
+  }
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if (data.type === "init" || data.type === "update") render(data);
+  };
+</script>
+
 </body>
 </html>
