@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Bitrix24 Live Wallboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#0b1220; color:#e6eefc; margin:20px; }
+    .grid { display:grid; grid-template-columns: repeat(2, minmax(240px, 1fr)); gap:16px; max-width:900px; }
+    .tile { background:#121b2f; border:1px solid #223055; border-radius:12px; padding:18px; }
+    .label { opacity:.8; font-size:14px; }
+    .value { font-size:46px; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <h2>📞 Live Now Wallboard</h2>
+
+  <div class="grid">
+    <div class="tile">
+      <div class="label">Inbound Ringing (Now)</div>
+      <div class="value" id="ringing">0</div>
+    </div>
+
+    <div class="tile">
+      <div class="label">Missed (Today)</div>
+      <div class="value" id="missed">0</div>
+    </div>
+  </div>
+
+  <script>
+    const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${wsProto}//${location.host}`);
+
+    function render(m) {
+      document.getElementById("ringing").textContent = m.inboundRinging ?? 0;
+      document.getElementById("missed").textContent  = m.missedToday ?? 0;
+    }
+
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.metrics) render(data.metrics);
+    };
+  </script>
+</body>
+</html>
