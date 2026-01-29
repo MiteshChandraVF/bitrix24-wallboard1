@@ -102,9 +102,12 @@ async function handleInstall(req, res) {
     const domain = req.query.domain || req.body.domain;
     const memberId = req.query.member_id || req.body.member_id;
 
-    if (!code || !domain || !memberId) {
-      return res.status(400).send("Missing code/domain/member_id");
-    }
+  if (!code || !domain || !memberId) {
+  // If a user opens the app from the Bitrix menu (no OAuth params),
+  // show the wallboard instead of an error.
+  return res.redirect(`${process.env.APP_BASE_URL}/`);
+}
+
 
     const clientId = process.env.BITRIX_CLIENT_ID;
     const clientSecret = process.env.BITRIX_CLIENT_SECRET;
