@@ -255,6 +255,8 @@ app.post("/bitrix/events", async (req, res) => {
   res.status(200).send("OK");
 
   const body = req.body || {};
+  console.log("📩 RAW EVENT:", JSON.stringify(body).slice(0, 4000));
+
   const eventName = extractEventName(body);
   const callId = extractCallId(body) || `unknown-${Date.now()}`; // keep live flow even if missing
   const agentId = extractAgentId(body);
