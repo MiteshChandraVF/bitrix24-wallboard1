@@ -151,13 +151,16 @@ app.get("/api/metrics", (req, res) => res.json({ metrics }));
 // -----------------------------
 // Install endpoint (GET/POST). Missing params => show UI.
 // -----------------------------
+// -----------------------------
+// Install endpoint (GET/POST). Missing params => show UI.
+// -----------------------------
 async function handleInstall(req, res) {
   try {
     const code = req.query.code || req.body.code;
     const domain = req.query.domain || req.body.domain;
     const memberId = req.query.member_id || req.body.member_id;
 
-    // If opened from menu / user action: show UI (NO binds here)
+    // If opened from menu / user action: show UI (NO awaits after return)
     if (!code || !domain || !memberId) {
       return res.redirect(`${process.env.APP_BASE_URL}/`);
     }
@@ -166,61 +169,10 @@ async function handleInstall(req, res) {
     const clientSecret = process.env.BITRIX_CLIENT_SECRET;
     const appBase = process.env.APP_BASE_URL;
 
-    // 1) Exchange code for token
-    const tokenUrl = `https://${domain}/oauth/token/`;
-    const tokenResp = await axios.get(tokenUrl, {
-      params: {
-        grant_type: "authorization_code",
-        client_id: clientId,
-        client_secret: clientSecret,
-        code
-      }
-    });
-
-    const { access_token, refresh_token, expires_in } = tokenResp.data;
-
-    portals.set(memberId, {
-      domain,
-      access_token,
-      refresh_token,
-      expires_at: Date.now() + (Number(expires_in || 3600) * 1000)
-    });
-
-    // 2) Bind events AFTER we have tokens
-    const handlerUrl = `${appBase}/bitrix/events`;
-
-    await bitrixRestCall(memberId, "event.bind", {
-      event: "OnVoximplantCallInit",
-      handler: handlerUrl
-    });
-
-    await bitrixRestCall(memberId, "event.bind", {
-      event: "OnVoximplantCallStart",
-      handler: handlerUrl
-    });
-
-    await bitrixRestCall(memberId, "event.bind", {
-      event: "OnVoximplantCallEnd",
-      handler: handlerUrl
-    });
-
-    console.log("✅ Installed + events bound (Init/Start/End):", { domain, memberId });
-
-    // 3) Redirect to UI
-    return res.redirect(`${appBase}/`);
-  } catch (e) {
-    console.error("❌ Install error:", e?.response?.data || e.message);
-    return res.status(500).send("Install failed. Check Railway logs.");
-  }
-}
-
-
-    const clientId = process.env.BITRIX_CLIENT_ID;
-    const clientSecret = process.env.BITRIX_CLIENT_SECRET;
-    const appBase = process.env.APP_BASE_URL;
-
     if (!clientId || !clientSecret || !appBase) {
-      return res.status(500).send("Missing env vars: BITRIX_CLIENT_ID / BITRIX_CLIENT_SECRET / APP_BASE_URL");
+      return res
+        .status(500)
+        .send("Missing env vars: BITRIX_CLIENT_ID / BITRIX_CLIENT_SECRET / APP_BASE_URL");
     }
 
     // Exchange code for token
@@ -243,13 +195,25 @@ async function handleInstall(req, res) {
       expires_at: Date.now() + (Number(expires_in || 3600) * 1000)
     });
 
-    // Bind telephony events
+    // Bind events AFTER tokens exist
     const handlerUrl = `${appBase}/bitrix/events`;
 
-    await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallInit", handler: handlerUrl });
-    await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallEnd", handler: handlerUrl });
+    await bitrixRestCall(memberId, "event.bind", {
+      event: "OnVoximplantCallInit",
+      handler: handlerUrl
+    });
 
-    console.log("✅ Installed + events bound:", { domain, memberId });
+    await bitrixRestCall(memberId, "event.bind", {
+      event: "OnVoximplantCallStart",
+      handler: handlerUrl
+    });
+
+    await bitrixRestCall(memberId, "event.bind", {
+      event: "OnVoximplantCallEnd",
+      handler: handlerUrl
+    });
+
+    console.log("✅ Installed + events bound (Init/Start/End):", { domain, memberId });
 
     return res.redirect(`${appBase}/`);
   } catch (e) {
@@ -257,6 +221,7 @@ async function handleInstall(req, res) {
     return res.status(500).send("Install failed. Check Railway logs.");
   }
 }
+
 app.get("/bitrix/install", handleInstall);
 app.post("/bitrix/install", handleInstall);
 
