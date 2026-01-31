@@ -293,5 +293,6 @@ app.post("/bitrix/events", (req, res) => {
 });
 
 // IMPORTANT: listen on 3000 so Caddy can reverse_proxy to it
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log("🚀 Node server listening on", PORT));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server running on ${PORT}`));
+
