@@ -19,7 +19,8 @@
  * Optional:
  *  - PORT (Railway sets automatically)
  */
-
+const multer = require("multer");
+const upload = multer();
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
