@@ -269,6 +269,11 @@ function extractNumbers(body) {
   return { from, to };
 }
 
+// Bitrix / network checks may call handler with GET. Must return 200.
+app.get("/bitrix/events", (req, res) => {
+  res.status(200).send("OK");
+});
+
 app.post("/bitrix/events", async (req, res) => {
   res.status(200).send("OK");
 
