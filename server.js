@@ -1,302 +1,346 @@
-/* server.js - Bitrix24 Wallboard Receiver (Railway) */
-const express = require("express");
-const http = require("http");
+/**
+ * server.js — Bitrix24 Wallboard webhook + WS broadcaster
+ *
+ * IMPORTANT (Railway):
+ * Your logs show Caddy is running and reverse_proxy tries 127.0.0.1:3000.
+ * So Node MUST listen on port 3000, not 8080, otherwise you'll get:
+ * dial tcp 127.0.0.1:3000: connect: connection refused
+ */
+
+const fs = require("fs");
 const path = require("path");
+const http = require("http");
+
+const express = require("express");
 const axios = require("axios");
 const WebSocket = require("ws");
 
 const app = express();
 
-/**
- * Body parsers
- * Bitrix install often comes as application/x-www-form-urlencoded
- * Events may be JSON or form-urlencoded depending on sender
- */
+// --- Body parsing (Bitrix can send form-encoded; your tests send JSON) ---
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-/** ---------------------------
- * In-memory state
- * -------------------------- */
-const portals = new Map(); // key: domain|member_id -> { domain, memberId, authId, refreshId, serverEndpoint, storedAt }
-const liveCalls = new Map(); // callId -> { direction, agentId, startedAt }
-const agents = new Map(); // agentId -> { id, inboundAnswered, inboundMissed, outboundAnswered, outboundMissed, onCallNow }
+// ---- Simple persistent store (best-effort; Railway filesystem may be ephemeral) ----
+const STORE_FILE = process.env.STORE_FILE || path.join("/tmp", "portal_store.json");
 
+function loadStore() {
+  try {
+    const raw = fs.readFileSync(STORE_FILE, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return { portals: {} };
+  }
+}
+function saveStore(store) {
+  try {
+    fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2), "utf8");
+  } catch (e) {
+    console.warn("⚠️ Could not persist store:", e.message);
+  }
+}
+
+const store = loadStore();
+
+/**
+ * portals key = `${domain}|${memberId}`
+ * value = { domain, memberId, authId, refreshId, serverEndpoint, installedAt, eventsBoundAt }
+ */
+
+// ---- Metrics + state ----
 const metrics = {
   incoming: { inProgress: 0, answered: 0, missed: 0 },
   outgoing: { inProgress: 0, answered: 0, cancelled: 0 },
-  missedDroppedAbandoned: 0
+  missedDroppedAbandoned: 0,
 };
 
+const liveCalls = new Map(); // callId -> { direction, agentId, startedAt }
+const agents = new Map(); // agentId -> { agentId, name, onCallNow, inboundMissed, outboundMissed }
+
+let lastEvent = null;
+
+// ---- Helpers ----
 function clampDown(obj, key) {
   if (!obj || typeof obj[key] !== "number") return;
   obj[key] = Math.max(0, obj[key] - 1);
 }
 
-function ensureAgent(agentId) {
+function ensureAgent(agentId, name) {
   if (!agentId) return null;
-  const id = String(agentId);
-  if (!agents.has(id)) {
-    agents.set(id, {
-      id,
-      inboundAnswered: 0,
+  if (!agents.has(agentId)) {
+    agents.set(agentId, {
+      agentId,
+      name: name || `Agent ${agentId}`,
+      onCallNow: false,
       inboundMissed: 0,
-      outboundAnswered: 0,
       outboundMissed: 0,
-      onCallNow: false
     });
+  } else if (name) {
+    agents.get(agentId).name = name;
   }
-  return agents.get(id);
+  return agents.get(agentId);
 }
 
-function getState() {
+function snapshotState() {
   return {
     ok: true,
-    portalsStored: portals.size,
+    portalsStored: Object.keys(store.portals || {}).length,
     metrics,
     liveCalls: Array.from(liveCalls.entries()).map(([callId, v]) => ({ callId, ...v })),
-    agents: Array.from(agents.values())
+    agents: Array.from(agents.values()),
+    lastEvent,
   };
 }
 
-/** ---------------------------
- * WebSocket (for wallboard UI)
- * -------------------------- */
+function getBaseUrl(req) {
+  // Railway behind proxy: trust x-forwarded-proto/host
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
+  const host = (req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
+  return `${proto}://${host}`;
+}
+
+// ---- WebSocket server (same HTTP server) ----
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 function broadcast() {
-  const payload = JSON.stringify({ type: "state", data: getState() });
+  const payload = JSON.stringify(snapshotState());
   for (const client of wss.clients) {
     if (client.readyState === WebSocket.OPEN) client.send(payload);
   }
 }
 
 wss.on("connection", (ws) => {
-  ws.send(JSON.stringify({ type: "state", data: getState() }));
+  ws.send(JSON.stringify(snapshotState()));
 });
 
-/** ---------------------------
- * Basic UI (simple wallboard page)
- * -------------------------- */
-app.get("/", (req, res) => {
-  // Minimal UI so you can confirm websocket + state quickly
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>Bitrix Wallboard</title>
-  <style>
-    body { font-family: Arial, sans-serif; padding: 16px; }
-    pre { background:#111; color:#0f0; padding:12px; border-radius:8px; overflow:auto; }
-    .row { display:flex; gap:12px; flex-wrap:wrap; }
-    .card { border:1px solid #ddd; border-radius:10px; padding:12px; min-width:220px; }
-    h2 { margin:0 0 8px 0; }
-    small { color:#777; }
-  </style>
-</head>
-<body>
-  <h2>Bitrix24 Wallboard (Live)</h2>
-  <small>WebSocket state updates</small>
-  <div class="row">
-    <div class="card"><b>Incoming In Progress:</b> <span id="inProg">0</span></div>
-    <div class="card"><b>Incoming Missed:</b> <span id="inMiss">0</span></div>
-    <div class="card"><b>Outgoing In Progress:</b> <span id="outProg">0</span></div>
-    <div class="card"><b>Outgoing Cancelled:</b> <span id="outCan">0</span></div>
-    <div class="card"><b>Missed/Dropped/Abandoned:</b> <span id="mda">0</span></div>
-  </div>
-
-  <h3>Raw State</h3>
-  <pre id="raw">{}</pre>
-
-  <script>
-    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.type !== "state") return;
-      const s = msg.data;
-      document.getElementById("inProg").textContent = s.metrics.incoming.inProgress;
-      document.getElementById("inMiss").textContent = s.metrics.incoming.missed;
-      document.getElementById("outProg").textContent = s.metrics.outgoing.inProgress;
-      document.getElementById("outCan").textContent = s.metrics.outgoing.cancelled;
-      document.getElementById("mda").textContent = s.metrics.missedDroppedAbandoned;
-      document.getElementById("raw").textContent = JSON.stringify(s, null, 2);
-    };
-  </script>
-</body>
-</html>
-  `);
-});
-
-/** ---------------------------
- * Health
- * -------------------------- */
+// ---- Health + debug ----
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-/** ---------------------------
- * Debug endpoints
- * -------------------------- */
-app.get("/debug/state", (req, res) => res.json(getState()));
+app.get("/debug/state", (req, res) => res.json(snapshotState()));
 
-app.get("/debug/offline", (req, res) => {
-  // If no portal token stored, show clear error
-  if (portals.size === 0) {
-    return res.status(400).json({ error: "No portal token stored yet. Reinstall the Bitrix app first." });
-  }
-
-  // Simulate an event for testing UI update
-  const fake = {
-    event: "OnVoximplantCallEnd",
-    callId: "debug-" + Date.now(),
-    direction: "IN",
-    agentId: "debugAgent"
-  };
-  handleEvent(fake);
-  return res.json({ ok: true, simulated: fake });
+app.get("/debug/last-event", (req, res) => {
+  if (!lastEvent) return res.status(404).json({ ok: false, error: "No events received yet." });
+  res.json({ ok: true, lastEvent });
 });
 
-/** ---------------------------
- * Bitrix install endpoint
- * -------------------------- */
-app.post("/bitrix/install", (req, res) => {
-  const ct = req.headers["content-type"] || "";
+app.get("/debug/offline", (req, res) => {
+  const count = Object.keys(store.portals || {}).length;
+  if (!count) return res.status(400).json({ error: "No portal token stored yet. Reinstall the Bitrix app first." });
+  res.json({ ok: true, portalsStored: count });
+});
+
+// ---- Bitrix install handler ----
+// Bitrix often hits this inside an iframe, POST form-encoded.
+app.all("/bitrix/install", async (req, res) => {
+  const ct = (req.headers["content-type"] || "").toLowerCase();
   console.log("🔧 INSTALL content-type:", ct);
   console.log("🔧 INSTALL query keys:", Object.keys(req.query || {}));
   console.log("🔧 INSTALL body keys:", Object.keys(req.body || {}));
 
-  // Bitrix sends domain in query as DOMAIN
-  const domain = req.query.DOMAIN || req.query.domain || req.body.DOMAIN || req.body.domain;
-  const memberId = req.body.member_id || req.body.MEMBER_ID || req.query.member_id || req.query.MEMBER_ID;
+  // Domain can arrive in query as DOMAIN, or body/domain-ish
+  const domain =
+    req.query.DOMAIN ||
+    req.body.DOMAIN ||
+    req.body.domain ||
+    req.query.domain ||
+    null;
 
-  // Tokens are typically in body
-  const authId = req.body.AUTH_ID || req.body.auth_id;
-  const refreshId = req.body.REFRESH_ID || req.body.refresh_id;
-  const serverEndpoint = req.body.SERVER_ENDPOINT || req.body.server_endpoint;
+  const memberId =
+    req.body.member_id ||
+    req.body.MEMBER_ID ||
+    req.query.member_id ||
+    req.query.MEMBER_ID ||
+    null;
+
+  const authId = req.body.AUTH_ID || req.body.auth || req.query.AUTH_ID || req.query.auth || null;
+  const refreshId = req.body.REFRESH_ID || null;
+  const serverEndpoint = req.body.SERVER_ENDPOINT || null;
 
   const missing = {
     domain: !domain,
     memberId: !memberId,
-    authId: !authId
+    authId: !authId,
+    serverEndpoint: !serverEndpoint,
   };
 
-  if (missing.domain || missing.memberId || missing.authId) {
+  if (missing.domain || missing.memberId || missing.authId || missing.serverEndpoint) {
     console.log("❌ INSTALL missing params:", missing);
-    return res.status(400).json({
-      error: "Missing install params",
-      missing,
-      got: { domain, memberId, authIdPresent: !!authId }
-    });
+    return res.status(400).json({ ok: false, error: "Missing install params", missing });
   }
 
   const key = `${domain}|${memberId}`;
-  portals.set(key, {
-    domain: String(domain),
-    memberId: String(memberId),
-    authId: String(authId),
-    refreshId: refreshId ? String(refreshId) : null,
-    serverEndpoint: serverEndpoint ? String(serverEndpoint) : null,
-    storedAt: new Date().toISOString()
-  });
+  store.portals[key] = {
+    domain,
+    memberId,
+    authId,
+    refreshId,
+    serverEndpoint,
+    installedAt: new Date().toISOString(),
+    eventsBoundAt: store.portals[key]?.eventsBoundAt || null,
+  };
+  saveStore(store);
 
   console.log("✅ INSTALL stored token for:", key);
-  broadcast();
 
-  // Bitrix likes a redirect after install
-  return res.redirect(302, "/?installed=1");
-});
+  // Bind Bitrix events to our handler URL
+  const baseUrl = getBaseUrl(req);
+  const handlerUrl = `${baseUrl}/bitrix/events`;
 
-/** ---------------------------
- * Bitrix events endpoint
- * -------------------------- */
-app.post("/bitrix/events", (req, res) => {
-  // Your earlier test used JSON: { "event": "OnVoximplantCallEnd" }
-  // Bitrix may post many other fields too
-  const payload = req.body || {};
+  try {
+    await bindBitrixEvent(serverEndpoint, authId, "OnVoximplantCallStart", handlerUrl);
+    await bindBitrixEvent(serverEndpoint, authId, "OnVoximplantCallEnd", handlerUrl);
 
-  // Some senders post raw JSON under "data"
-  const evt = payload.event || payload.EVENT || (payload.data && payload.data.event);
-  if (!evt) {
-    // still return 200 to avoid Bitrix retries storm
-    console.log("⚠️ EVENTS missing event field. body keys:", Object.keys(payload));
-    return res.status(200).json({ ok: true, ignored: true });
+    store.portals[key].eventsBoundAt = new Date().toISOString();
+    saveStore(store);
+
+    console.log("✅ Events bound to:", handlerUrl);
+  } catch (e) {
+    console.error("❌ Failed to bind events:", e?.response?.data || e.message);
+    // Don't fail install hard, but surface for debugging
+    return res.status(500).json({
+      ok: false,
+      error: "Stored token, but failed to bind events",
+      details: e?.response?.data || e.message,
+      handlerUrl,
+    });
   }
 
-  handleEvent(payload);
-  return res.status(200).json({ ok: true });
+  // Redirect to wallboard UI
+  return res.redirect(302, "/");
 });
 
-/** ---------------------------
- * Event handler (core logic)
- * -------------------------- */
-function handleEvent(payload) {
-  const eventName = payload.event || payload.EVENT;
+// ---- Bitrix event binding helper ----
+// Bitrix REST typically accepts auth as `auth` parameter.
+// Many Bitrix endpoints expect x-www-form-urlencoded.
+async function bindBitrixEvent(serverEndpoint, authId, eventName, handlerUrl) {
+  if (!serverEndpoint) throw new Error("Missing SERVER_ENDPOINT");
+  if (!authId) throw new Error("Missing AUTH_ID");
 
-  // Flexible field mapping (Bitrix can vary)
+  // serverEndpoint usually looks like: https://<domain>/rest/
+  // We call: <serverEndpoint>event.bind
+  const url = serverEndpoint.endsWith("/") ? `${serverEndpoint}event.bind` : `${serverEndpoint}/event.bind`;
+
+  const form = new URLSearchParams();
+  form.set("auth", authId);
+  form.set("event", eventName);
+  form.set("handler", handlerUrl);
+
+  const resp = await axios.post(url, form.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 15000,
+  });
+
+  // Bitrix usually returns { result: true } or similar
+  return resp.data;
+}
+
+// ---- Bitrix events receiver ----
+app.get("/bitrix/events", (req, res) => {
+  // Friendly response so "Cannot GET /bitrix/events" doesn't confuse you anymore
+  res.status(200).json({
+    ok: true,
+    message: "Use POST /bitrix/events. This endpoint receives Bitrix telephony events.",
+  });
+});
+
+app.post("/bitrix/events", (req, res) => {
+  // Bitrix might send event info in body or query
+  const body = req.body || {};
+  const eventName = body.event || req.query.event || null;
+
+  // Some Bitrix payloads put parameters under `data` or `params`
+  const data = body.data || body.params || body;
+
+  // Try common call id fields
   const callId =
-    payload.callId ||
-    payload.CALL_ID ||
-    payload.call_id ||
-    (payload.data && (payload.data.callId || payload.data.CALL_ID));
+    data.CALL_ID ||
+    data.callId ||
+    data.call_id ||
+    data.CALLID ||
+    data.id ||
+    null;
 
+  // Try common direction / agent fields
   const direction =
-    payload.direction ||
-    payload.DIRECTION ||
-    payload.callDirection ||
-    (payload.data && (payload.data.direction || payload.data.DIRECTION)) ||
-    "IN";
+    data.DIRECTION ||
+    data.direction ||
+    data.callDirection ||
+    null;
 
   const agentId =
-    payload.agentId ||
-    payload.AGENT_ID ||
-    payload.userId ||
-    payload.USER_ID ||
-    (payload.data && (payload.data.agentId || payload.data.userId));
+    data.USER_ID ||
+    data.userId ||
+    data.agentId ||
+    data.AGENT_ID ||
+    null;
 
-  console.log("📩 EVENT:", eventName, { callId, direction, agentId });
+  const agentName =
+    data.USER_NAME ||
+    data.userName ||
+    data.agentName ||
+    null;
 
-  // Minimal logic to prove updates work.
+  lastEvent = {
+    receivedAt: new Date().toISOString(),
+    eventName,
+    callId,
+    direction,
+    agentId,
+    raw: body,
+  };
+
+  // Log just enough (avoid huge dumps in logs)
+  console.log("📩 EVENT", { eventName, callId, direction, agentId });
+
+  // If we can't interpret the event, still ACK 200 so Bitrix doesn't retry forever
+  if (!eventName) {
+    broadcast();
+    return res.status(200).json({ ok: true, warning: "No eventName in payload", received: true });
+  }
+
+  // --- Event handling ---
   if (eventName === "OnVoximplantCallStart") {
-    if (!callId) return;
+    // Decide IN/OUT
+    const dir = (direction || "").toString().toUpperCase();
+    const normalizedDir = dir.startsWith("OUT") ? "OUT" : "IN";
 
-    liveCalls.set(String(callId), {
-      direction: String(direction).toUpperCase() === "OUT" ? "OUT" : "IN",
-      agentId: agentId ? String(agentId) : null,
-      startedAt: Date.now()
-    });
-
-    if (String(direction).toUpperCase() === "OUT") metrics.outgoing.inProgress += 1;
-    else metrics.incoming.inProgress += 1;
+    if (normalizedDir === "IN") metrics.incoming.inProgress += 1;
+    else metrics.outgoing.inProgress += 1;
 
     if (agentId) {
-      const a = ensureAgent(agentId);
+      const a = ensureAgent(String(agentId), agentName);
       if (a) a.onCallNow = true;
     }
 
+    if (callId) {
+      liveCalls.set(String(callId), {
+        direction: normalizedDir,
+        agentId: agentId ? String(agentId) : null,
+        startedAt: Date.now(),
+      });
+    }
+
     broadcast();
-    return;
+    return res.status(200).json({ ok: true });
   }
 
   if (eventName === "OnVoximplantCallEnd") {
     if (!callId) {
-      // Still update something if no callId came through (your reqbin test)
       broadcast();
-      return;
+      return res.status(200).json({ ok: true, warning: "No callId for CallEnd" });
     }
 
     const lc = liveCalls.get(String(callId));
     if (!lc) {
-      // If we didn't record start, still broadcast for visibility
       broadcast();
-      return;
+      return res.status(200).json({ ok: true, warning: "Call not found in liveCalls" });
     }
 
     if (lc.direction === "IN") clampDown(metrics.incoming, "inProgress");
     else clampDown(metrics.outgoing, "inProgress");
 
-    // Your current logic: treat IN end as missed, OUT end as cancelled.
-    // You can refine later based on status codes.
+    // Basic tally (refine later if you get proper status fields)
     if (lc.direction === "IN") {
       metrics.incoming.missed += 1;
       metrics.missedDroppedAbandoned += 1;
@@ -319,18 +363,38 @@ function handleEvent(payload) {
 
     liveCalls.delete(String(callId));
     broadcast();
-    return;
+    return res.status(200).json({ ok: true });
   }
 
-  // Any other event — just broadcast state so UI can reflect changes
+  // Unknown event: still broadcast so UI can show lastEvent
   broadcast();
-}
-
-/** ---------------------------
- * Start server
- * -------------------------- */
-// No Caddy now: Railway provides PORT. Must listen on process.env.PORT.
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on ${PORT}`);
+  return res.status(200).json({ ok: true, ignored: true });
 });
+
+// ---- Serve your wallboard UI (optional) ----
+// If you have a /public/index.html, enable this. Otherwise remove.
+// app.use(express.static(path.join(__dirname, "public")));
+
+// Root placeholder (so / doesn't 404 if you don't serve static)
+app.get("/", (req, res) => {
+  res.status(200).send(`
+    <html>
+      <head><title>Bitrix Wallboard</title></head>
+      <body style="font-family: Arial; padding: 20px;">
+        <h2>Bitrix Wallboard Service</h2>
+        <ul>
+          <li><a href="/health">/health</a></li>
+          <li><a href="/debug/state">/debug/state</a></li>
+          <li><a href="/debug/last-event">/debug/last-event</a></li>
+          <li><a href="/debug/offline">/debug/offline</a></li>
+        </ul>
+        <p>Webhook endpoint: <code>POST /bitrix/events</code></p>
+      </body>
+    </html>
+  `);
+});
+
+// ---- LISTEN ----
+// Force 3000 so Caddy reverse_proxy works (your logs show it proxies to 127.0.0.1:3000)
+const PORT = 3000;
+server.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server running on ${PORT}`));
