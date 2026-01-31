@@ -50,6 +50,20 @@ async function bitrixRestCall(memberId, method, params = {}) {
   });
 }
 
+
+app.get("/debug/offline", async (req, res) => {
+  try {
+    const memberId = Array.from(portals.keys())[0];
+    if (!memberId) return res.status(400).json({ error: "No portal token stored. Reinstall app first." });
+
+    const r = await bitrixRestCall(memberId, "event.offline.get", {});
+    res.json(r.data || r);
+  } catch (e) {
+    res.status(500).json({ error: e?.response?.data || e.message });
+  }
+});
+
+
 /* =========================
    Serve Wallboard UI
    ========================= */
