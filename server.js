@@ -1,26 +1,22 @@
 /**
- * server.js — Bitrix24 Live Wallboard (Railway) — COMPLETE & ROBUST
+ * server.js — Bitrix24 Live Wallboard (Railway) — FINAL (supports Bitrix AUTH_ID installs)
  *
- * Fixes:
- *  ✅ Serves UI at /
- *  ✅ /bitrix/install accepts Bitrix params from query, body, or body.auth
- *  ✅ Logs install payload KEYS (no secrets) to diagnose Bitrix install payload format
- *  ✅ Stores portal token in memory (NOTE: will reset on redeploy/restart)
- *  ✅ Binds telephony events Init/Start/End to /bitrix/events
- *  ✅ /bitrix/events supports GET (health check) and POST (events)
- *  ✅ WebSocket pushes updates to wallboard instantly
- *  ✅ /debug/offline checks Bitrix offline events queue (requires token stored)
+ * Works with Bitrix24 Cloud Local App install payload:
+ *  - AUTH_ID (access token)
+ *  - REFRESH_ID
+ *  - SERVER_ENDPOINT (e.g. https://YOURDOMAIN/rest/)
+ *  - member_id
+ * and also supports OAuth "code" flow (if present).
  *
  * Required env vars (Railway Variables):
  *  - APP_BASE_URL           e.g. https://bitrix24-wallboard1-production.up.railway.app
- *  - BITRIX_CLIENT_ID
- *  - BITRIX_CLIENT_SECRET
+ *  - BITRIX_CLIENT_ID       (only used for OAuth code flow)
+ *  - BITRIX_CLIENT_SECRET   (only used for OAuth code flow)
  *
  * Optional:
- *  - PORT (Railway sets automatically)
+ *  - PORT
  */
-const multer = require("multer");
-const upload = multer();
+
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -29,7 +25,7 @@ const path = require("path");
 
 const app = express();
 
-/** IMPORTANT: body parsers must be BEFORE routes */
+/** body parsers MUST be BEFORE routes */
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static("public"));
@@ -44,9 +40,10 @@ const wss = new WebSocket.Server({ server });
    For production: store tokens in Postgres/Redis.
 */
 const portals = new Map(); // member_id → { domain, access_token, refresh_token, expires_at }
+
+/* Live state */
 const liveCalls = new Map(); // callId → { callId, direction, startedAt, agentId }
 const agentLive = new Map(); // agentId → stats
-
 const metrics = {
   incoming: { inProgress: 0, missed: 0, cancelled: 0 },
   outgoing: { inProgress: 0, missed: 0, cancelled: 0 },
@@ -63,6 +60,16 @@ function pick(obj, ...keys) {
     if (v !== undefined && v !== null && v !== "") return v;
   }
   return null;
+}
+
+function parseDomainFromServerEndpoint(serverEndpoint) {
+  // Expected: https://SOMEDOMAIN/rest/ or https://SOMEDOMAIN/rest/123/...
+  try {
+    const u = new URL(serverEndpoint);
+    return u.host;
+  } catch {
+    return null;
+  }
 }
 
 function ensureAgent(agentId) {
@@ -114,10 +121,14 @@ async function bitrixRestCall(memberId, method, params = {}) {
   const p = portals.get(memberId);
   if (!p) throw new Error("Portal not installed (missing token).");
 
+  // Official REST endpoint:
+  // https://{domain}/rest/{method}
   const url = `https://${p.domain}/rest/${method}`;
+
   const resp = await axios.post(url, params, {
     headers: { Authorization: `Bearer ${p.access_token}` }
   });
+
   return resp.data;
 }
 
@@ -182,74 +193,107 @@ async function handleInstall(req, res) {
   try {
     const q = req.query || {};
     const b = req.body || {};
-    const a = b.auth || b.AUTH || b?.data?.auth || {};
 
-    // Debug: show only keys (no secrets)
+    // Bitrix "Local App" install often sends these:
+    // query: DOMAIN, PROTOCOL, LANG, APP_SID
+    // body: AUTH_ID, REFRESH_ID, SERVER_ENDPOINT, member_id, status, PLACEMENT, PLACEMENT_OPTIONS
     console.log("🔧 INSTALL content-type:", req.headers["content-type"]);
     console.log("🔧 INSTALL query keys:", Object.keys(q));
     console.log("🔧 INSTALL body keys:", Object.keys(b));
-    if (a && typeof a === "object") console.log("🔧 INSTALL auth keys:", Object.keys(a));
 
-    const code = pick(q, "code") || pick(b, "code") || pick(a, "code");
-    const domain =
-      pick(q, "domain") ||
-      pick(b, "domain") ||
-      pick(a, "domain") ||
-      pick(q, "server_domain") ||
-      pick(b, "server_domain") ||
-      pick(a, "server_domain");
-    const memberId =
-      pick(q, "member_id") ||
-      pick(b, "member_id") ||
-      pick(a, "member_id") ||
-      pick(q, "memberId") ||
-      pick(b, "memberId") ||
-      pick(a, "memberId");
+    const memberId = pick(b, "member_id") || pick(q, "member_id") || pick(b, "memberId") || pick(q, "memberId");
 
-    // If opened from menu / user action: show UI (no install params)
-    if (!code || !domain || !memberId) {
-      console.log("❌ INSTALL missing params:", { code: !!code, domain: !!domain, memberId: !!memberId });
+    // CASE A) Your current Bitrix payload: direct token install
+    const authId = pick(b, "AUTH_ID");
+    const refreshId = pick(b, "REFRESH_ID");
+    const serverEndpoint = pick(b, "SERVER_ENDPOINT");
+
+    // DOMAIN sometimes comes in query uppercase
+    const domainUpper = pick(q, "DOMAIN");
+    const domainLower = pick(q, "domain");
+    const derivedDomain = serverEndpoint ? parseDomainFromServerEndpoint(serverEndpoint) : null;
+
+    const domain = domainLower || domainUpper || derivedDomain;
+
+    if (memberId && authId && domain) {
+      // Store token immediately (no OAuth exchange needed)
+      portals.set(memberId, {
+        domain,
+        access_token: authId,
+        refresh_token: refreshId || null,
+        // AUTH_EXPIRES is seconds; if missing, keep 1 hour default
+        expires_at: Date.now() + (Number(pick(b, "AUTH_EXPIRES") || 3600) * 1000)
+      });
+
+      const handlerUrl = `${process.env.APP_BASE_URL}/bitrix/events`;
+
+      // Bind telephony events (if telephony scope/plan allows)
+      try {
+        await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallInit", handler: handlerUrl });
+        await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallStart", handler: handlerUrl });
+        await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallEnd", handler: handlerUrl });
+        console.log("✅ Installed via AUTH_ID + events bound:", { domain, memberId, handlerUrl });
+      } catch (bindErr) {
+        console.log("⚠️ Token stored but event.bind failed:", bindErr?.response?.data || bindErr.message);
+      }
+
       return res.redirect(`${process.env.APP_BASE_URL}/`);
     }
 
-    const clientId = process.env.BITRIX_CLIENT_ID;
-    const clientSecret = process.env.BITRIX_CLIENT_SECRET;
-    const appBase = process.env.APP_BASE_URL;
+    // CASE B) OAuth code flow (only if Bitrix sends `code`)
+    const code = pick(q, "code") || pick(b, "code");
+    const oauthDomain =
+      pick(q, "domain") ||
+      pick(b, "domain") ||
+      pick(q, "DOMAIN") ||
+      pick(b, "DOMAIN") ||
+      derivedDomain;
 
-    if (!clientId || !clientSecret || !appBase) {
-      return res.status(500).send("Missing env vars: BITRIX_CLIENT_ID / BITRIX_CLIENT_SECRET / APP_BASE_URL");
+    if (code && oauthDomain && memberId) {
+      const clientId = process.env.BITRIX_CLIENT_ID;
+      const clientSecret = process.env.BITRIX_CLIENT_SECRET;
+
+      if (!clientId || !clientSecret) {
+        return res.status(500).send("Missing BITRIX_CLIENT_ID / BITRIX_CLIENT_SECRET for OAuth flow.");
+      }
+
+      const tokenUrl = `https://${oauthDomain}/oauth/token/`;
+      const tokenResp = await axios.get(tokenUrl, {
+        params: {
+          grant_type: "authorization_code",
+          client_id: clientId,
+          client_secret: clientSecret,
+          code
+        }
+      });
+
+      const { access_token, refresh_token, expires_in } = tokenResp.data;
+
+      portals.set(memberId, {
+        domain: oauthDomain,
+        access_token,
+        refresh_token,
+        expires_at: Date.now() + (Number(expires_in || 3600) * 1000)
+      });
+
+      const handlerUrl = `${process.env.APP_BASE_URL}/bitrix/events`;
+      await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallInit", handler: handlerUrl });
+      await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallStart", handler: handlerUrl });
+      await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallEnd", handler: handlerUrl });
+
+      console.log("✅ Installed via OAuth code + events bound:", { oauthDomain, memberId, handlerUrl });
+      return res.redirect(`${process.env.APP_BASE_URL}/`);
     }
 
-    // Exchange code for token
-    const tokenUrl = `https://${domain}/oauth/token/`;
-    const tokenResp = await axios.get(tokenUrl, {
-      params: {
-        grant_type: "authorization_code",
-        client_id: clientId,
-        client_secret: clientSecret,
-        code
-      }
+    console.log("❌ INSTALL missing required fields:", {
+      memberId: !!memberId,
+      authId: !!authId,
+      domain: !!domain,
+      code: !!code
     });
 
-    const { access_token, refresh_token, expires_in } = tokenResp.data;
-
-    portals.set(memberId, {
-      domain,
-      access_token,
-      refresh_token,
-      expires_at: Date.now() + (Number(expires_in || 3600) * 1000)
-    });
-
-    const handlerUrl = `${appBase}/bitrix/events`;
-
-    // Bind telephony events
-    await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallInit", handler: handlerUrl });
-    await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallStart", handler: handlerUrl });
-    await bitrixRestCall(memberId, "event.bind", { event: "OnVoximplantCallEnd", handler: handlerUrl });
-
-    console.log("✅ Installed + events bound (Init/Start/End):", { domain, memberId, handlerUrl });
-
-    return res.redirect(`${appBase}/`);
+    // If opened from menu / user action: show UI
+    return res.redirect(`${process.env.APP_BASE_URL}/`);
   } catch (e) {
     console.error("❌ Install error:", e?.response?.data || e.message);
     return res.status(500).send("Install failed. Check Railway logs.");
@@ -305,7 +349,6 @@ function extractDirection(body) {
   if (v.includes("out")) return "OUT";
   if (v.includes("in")) return "IN";
 
-  // fallback heuristics
   const ct = body?.data?.FIELDS?.CALL_TYPE;
   if (ct === "out" || ct === 2) return "OUT";
   return "IN";
@@ -333,7 +376,7 @@ app.post("/bitrix/events", (req, res) => {
 
     if (agentId) {
       const a = ensureAgent(agentId);
-      if (a) a.onCallNow = true; // may be ringing; Start will confirm
+      if (a) a.onCallNow = true;
     }
 
     broadcast();
@@ -362,8 +405,7 @@ app.post("/bitrix/events", (req, res) => {
       if (lc.direction === "IN") clampDown(metrics.incoming, "inProgress");
       else clampDown(metrics.outgoing, "inProgress");
 
-      // Basic classification (until we enrich with call history):
-      // If it ended and was inbound, count missed/abandoned bucket.
+      // Basic classification until we enrich from voximplant.statistic.get
       if (lc.direction === "IN") {
         metrics.incoming.missed += 1;
         metrics.missedDroppedAbandoned += 1;
@@ -380,7 +422,6 @@ app.post("/bitrix/events", (req, res) => {
         }
       }
 
-      // clear agent on-call
       if (lc.agentId) {
         const a = ensureAgent(lc.agentId);
         if (a) a.onCallNow = false;
