@@ -50,16 +50,23 @@ async function bitrixRestCall(memberId, method, params = {}) {
   });
 }
 
-
+/* =========================
+   dedug -offline
+   ========================= */
 app.get("/debug/offline", async (req, res) => {
   try {
     const memberId = Array.from(portals.keys())[0];
-    if (!memberId) return res.status(400).json({ error: "No portal token stored. Reinstall app first." });
+    if (!memberId) {
+      return res.status(400).json({
+        error: "No portal token stored yet. Reinstall the Bitrix app first."
+      });
+    }
 
     const r = await bitrixRestCall(memberId, "event.offline.get", {});
-    res.json(r.data || r);
+    // bitrixRestCall returns an axios response in your current code
+    return res.json(r.data);
   } catch (e) {
-    res.status(500).json({ error: e?.response?.data || e.message });
+    return res.status(500).json({ error: e?.response?.data || e.message });
   }
 });
 
