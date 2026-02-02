@@ -418,22 +418,6 @@ app.post("/bitrix/events", (req, res) => {
 });
 
 
-// -------------------- WEBSOCKET --------------------
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
-wss.on("connection", (ws) => {
-  // Send initial state immediately
-  const snapshot = {
-    ok: true,
-    metrics,
-    portalsStored: Object.keys(portalTokens).length,
-    tokensFile: TOKENS_FILE,
-    liveCalls: Array.from(liveCalls.entries()).map(([callId, c]) => ({ callId, ...c })),
-    agents: Array.from(agents.values()),
-  };
-  ws.send(JSON.stringify(snapshot));
-});
 
 // -------------------- LISTEN --------------------
 const PORT = parseInt(process.env.PORT || "3000", 10);
