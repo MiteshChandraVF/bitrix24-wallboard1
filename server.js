@@ -417,12 +417,38 @@ app.post("/bitrix/events", (req, res) => {
   broadcast();
 });
 
-// -------------------- KEEPALIVE LOG (helps debugging) --------------------
-setInterval(() => {
-  console.log("🫀 alive", new Date().toISOString());
-}, 30000);
 
-// -------------------- START SERVER --------------------
+// -------------------- WEBSOCKET --------------------
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+wss.on("connection", (ws) => {
+  // Send initial state immediately
+  const snapshot = {
+    ok: true,
+    metrics,
+    portalsStored: Object.keys(portalTokens).length,
+    tokensFile: TOKENS_FILE,
+    liveCalls: Array.from(liveCalls.entries()).map(([callId, c]) => ({ callId, ...c })),
+    agents: Array.from(agents.values()),
+  };
+  ws.send(JSON.stringify(snapshot));
+});
+
+// -------------------- LISTEN --------------------
+const PORT = parseInt(process.env.PORT || "3000", 10);
+
+// IMPORTANT: only ONE listen. Railway must see this port open.
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on ${PORT}`);
+  if (!BITRIX_WEBHOOK_BASE) {
+    console.log("⚠️ BITRIX_WEBHOOK_BASE is not set (event.bind will fail).");
+  }
+  if (!PUBLIC_URL) {
+    console.log("⚠️ PUBLIC_URL is not set (handler URL will be wrong).");
+  } else {
+    console.log("🔗 Handler URL:", getHandlerUrl());
+  }
 });
+
+setInterval(() => console.log("🫀 alive", new Date().toISOString()), 30000);
