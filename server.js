@@ -562,7 +562,7 @@ function getWallboardHtml() {
         <div class="brand-left">
           <div class="dot"></div>
           <div>
-            <h1>Bitrix24 Call Wallboard</h1>
+            <h1>Fincorp Contact Center Wallboard</h1>
             <div class="sub">Live call activity • Auto-refresh</div>
           </div>
         </div>
