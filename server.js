@@ -439,3 +439,5 @@ server.listen(PORT, "0.0.0.0", () => {
     console.log("🔗 Handler URL:", getHandlerUrl());
   }
 });
+
+setInterval(() => console.log("🫀 alive", new Date().toISOString()), 30000);
