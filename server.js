@@ -405,7 +405,7 @@ function getWallboardHtml() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Bitrix24 Wallboard</title>
+  <title>Fincorp Contact Center Wallboard</title>
   <style>
     :root{
       --vodafone-red:#E60000;
