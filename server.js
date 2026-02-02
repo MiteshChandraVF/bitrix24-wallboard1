@@ -1,149 +1,150 @@
 /**
- * Bitrix24 Wallboard Backend (Railway)
- * ------------------------------------------------------------
- * Key design change:
- * ✅ DO NOT call event.bind from the backend (avoids 403 WRONG_AUTH_TYPE)
- * ✅ Use Bitrix24 OUTGOING WEBHOOK (configured in Bitrix UI) to POST events to:
- *    https://<your-public-domain>/bitrix/events
+ * server.js — Bitrix24 Wallboard Backend (Railway)
+ * ------------------------------------------------
+ * Key fixes included:
+ * 1) ✅ NO event.bind from backend (prevents WRONG_AUTH_TYPE 403)
+ * - Outbound Webhook in Bitrix handles event delivery to /bitrix/events
  *
- * What this server provides:
- * - POST /bitrix/events   (receives Bitrix webhook event payloads)
- * - GET  /debug/state     (see current metrics + liveCalls + agents)
- * - GET  /health          (Railway healthcheck)
- * - GET  /               (simple status)
+ * 2) ✅ Stable storage for tokens/portals using Railway Volume
+ * - DATA_DIR=/data (Railway service variable)
  *
- * Optional:
- * - POST /bitrix/install  (kept for compatibility; stores portal key only; no binding)
+ * 3) ✅ /bitrix/events accepts ONLY POST (Bitrix outbound webhook)
+ * - Logs inbound webhook payload
+ * - Normalizes event names to UPPERCASE and supports CamelCase too
  *
- * ENV VARS (Railway → Service → Variables):
- * - PUBLIC_URL=https://bitrix24-wallboard1-production.up.railway.app   (recommended)
- * - DATA_DIR=/data                                                  (recommended; Railway volume mount)
- * - BITRIX_WEBHOOK_SECRET=someStrongSecret                           (optional: verify outgoing webhook secret/header)
- *
- * NOTE:
- * - Your Bitrix24 OUTGOING webhook should point to:
- *   https://bitrix24-wallboard1-production.up.railway.app/bitrix/events
- * - Add Voximplant events there:
- *   OnVoximplantCallInit, OnVoximplantCallStart, OnVoximplantCallConnected, OnVoximplantCallEnd
+ * 4) ✅ Debug endpoints:
+ * - /health
+ * - /debug/state
+ * - /debug/last-events (optional)
  */
+
+"use strict";
 
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
 
-const app = express();
-
-// Bitrix sends application/x-www-form-urlencoded sometimes, and application/json other times.
-// Support both:
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
-
-// -------------------- ENV / PATHS --------------------
+// -------------------- Config --------------------
 const PORT = parseInt(process.env.PORT || "3000", 10);
-const PUBLIC_URL =
-  (process.env.PUBLIC_URL || "").trim() ||
-  `https://${process.env.RAILWAY_PUBLIC_DOMAIN || "localhost"}`;
 
-// Data dir (Railway volume should be mounted to /data)
+// PUBLIC_URL should be your Railway public domain (HTTPS)
+const PUBLIC_URL = (process.env.PUBLIC_URL || "").trim();
+
+// Persist tokens/portal info
 const DATA_DIR = (process.env.DATA_DIR || "/data").trim();
-try {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-} catch (e) {
-  console.error("❌ Could not create DATA_DIR:", DATA_DIR, e.message);
-}
-
 const TOKENS_FILE = path.join(DATA_DIR, "portalTokens.json");
-let portalTokens = {};
 
-// -------------------- HELPERS --------------------
-function loadTokens() {
-  try {
-    if (fs.existsSync(TOKENS_FILE)) {
-      const raw = fs.readFileSync(TOKENS_FILE, "utf8");
-      portalTokens = raw ? JSON.parse(raw) : {};
-    } else {
-      portalTokens = {};
-    }
-  } catch (e) {
-    console.error("❌ Tokens load error:", e.message);
-    portalTokens = {};
-  }
-  console.log("💾 Tokens file:", TOKENS_FILE);
-  console.log("🔑 Tokens loaded:", Object.keys(portalTokens).length);
-}
+// Optional: Outbound webhook token (if you want to validate source)
+const BITRIX_OUTBOUND_TOKEN = (process.env.BITRIX_OUTBOUND_TOKEN || "").trim();
 
-function saveTokens(obj) {
-  try {
-    fs.writeFileSync(TOKENS_FILE, JSON.stringify(obj, null, 2), "utf8");
-    console.log("💾 Tokens saved to:", TOKENS_FILE);
-  } catch (e) {
-    console.error("❌ Tokens save error:", e.message);
-  }
-}
+// In-memory state
+let portalTokens = {}; // stored in TOKENS_FILE
+const lastEvents = []; // keep last N webhook events for debugging
 
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function clampDown(bucket, key) {
-  bucket[key] = Math.max(0, (bucket[key] || 0) - 1);
-}
-
-// -------------------- STATE (metrics + live calls + agents) --------------------
+// Example metrics state (you can replace with your own structure)
 const metrics = {
   incoming: { inProgress: 0, answered: 0, missed: 0 },
   outgoing: { inProgress: 0, answered: 0, cancelled: 0 },
   missedDroppedAbandoned: 0,
 };
+const liveCalls = new Map(); // callId -> {direction, agentId, ...}
+const agents = new Map(); // agentId -> { onCallNow, inboundMissed, outboundMissed, ... }
 
-// callId -> { callId, direction: 'IN'|'OUT', startedAt, phone, lineName, agentId }
-const liveCalls = new Map();
+// -------------------- Helpers --------------------
+function ensureDir(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    console.error("❌ Failed to create DATA_DIR:", dir, e);
+  }
+}
 
-// agentId -> { agentId, name?, onCallNow, inboundAnswered, inboundMissed, outboundAnswered, outboundMissed }
-const agents = new Map();
+function loadTokens() {
+  try {
+    ensureDir(DATA_DIR);
+    if (!fs.existsSync(TOKENS_FILE)) return {};
+    const raw = fs.readFileSync(TOKENS_FILE, "utf8");
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    console.error("❌ Failed to load tokens:", e);
+    return {};
+  }
+}
 
-function ensureAgent(agentId, name) {
+function saveTokens(obj) {
+  try {
+    ensureDir(DATA_DIR);
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(obj, null, 2), "utf8");
+  } catch (e) {
+    console.error("❌ Failed to save tokens:", e);
+  }
+}
+
+function pushLastEvent(evt) {
+  lastEvents.unshift(evt);
+  while (lastEvents.length > 25) lastEvents.pop();
+}
+
+function normalizeEventName(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "UNKNOWN";
+
+  // Many Bitrix outbound webhooks arrive like: ONVOXIMPLANTCALLINIT
+  // Some older code may send: OnVoximplantCallInit
+  // Normalize to uppercase token for comparisons:
+  return s.toUpperCase();
+}
+
+function clampDown(obj, key) {
+  if (!obj || typeof obj[key] !== "number") return;
+  obj[key] = Math.max(0, obj[key] - 1);
+}
+
+function ensureAgent(agentId) {
   if (!agentId) return null;
   if (!agents.has(agentId)) {
     agents.set(agentId, {
       agentId,
-      name: name || "",
       onCallNow: false,
-      inboundAnswered: 0,
       inboundMissed: 0,
-      outboundAnswered: 0,
       outboundMissed: 0,
     });
-  } else if (name && !agents.get(agentId).name) {
-    agents.get(agentId).name = name;
   }
   return agents.get(agentId);
 }
 
-// -------------------- SIMPLE "ALIVE" LOG (helps diagnose restarts) --------------------
+// -------------------- App --------------------
+const app = express();
+
+// Bitrix outbound webhook often sends application/x-www-form-urlencoded
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "2mb" }));
+
+// Simple “alive” heartbeat in logs (helps confirm container not sleeping)
 setInterval(() => {
-  console.log("🫀 alive", nowISO());
+  console.log("🫀 alive", new Date().toISOString());
 }, 30_000);
 
-// -------------------- BOOT --------------------
-console.log("🔗 Handler URL:", `${PUBLIC_URL.replace(/\/+$/, "")}/bitrix/events`);
+// Boot logs
 console.log("🚀 Boot");
-loadTokens();
+console.log("💾 Tokens file:", TOKENS_FILE);
+portalTokens = loadTokens();
+console.log("🔑 Tokens loaded:", Object.keys(portalTokens).length);
 
-// -------------------- ROUTES --------------------
+const handlerUrl =
+  PUBLIC_URL && PUBLIC_URL.startsWith("http")
+    ? `${PUBLIC_URL.replace(/\/+$/, "")}/bitrix/events`
+    : "(set PUBLIC_URL to show handler)";
+console.log("🔗 Handler URL:", handlerUrl);
+
+// Root
 app.get("/", (req, res) => {
   res.type("text/plain").send("Bitrix24 Wallboard Backend is running.");
 });
 
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-/**
- * INSTALL callback (optional)
- * If you are NOT using an iframe app, you can ignore this endpoint.
- * Keeping it here because you previously used it; it stores minimal portal info.
- *
- * IMPORTANT: We DO NOT call event.bind here anymore.
- */
+// -------------------- INSTALL ENDPOINT --------------------
+// NOTE: We do NOT event.bind here.
+// Outbound Webhook in Bitrix UI pushes events to /bitrix/events.
 app.post("/bitrix/install", (req, res) => {
   try {
     console.log("🔧 INSTALL content-type:", req.headers["content-type"]);
@@ -159,16 +160,18 @@ app.post("/bitrix/install", (req, res) => {
     portalTokens[key] = {
       domain,
       memberId,
-      installedAt: nowISO(),
+      installedAt: new Date().toISOString(),
     };
+
     saveTokens(portalTokens);
+    console.log("✅ INSTALL stored portal key:", key);
+    console.log("💾 Tokens saved to:", TOKENS_FILE);
 
     return res.json({
       ok: true,
       message:
-        "Installed. Configure Bitrix24 OUTGOING webhook to POST events to /bitrix/events (no REST event.bind required).",
-      handler: `${PUBLIC_URL.replace(/\/+$/, "")}/bitrix/events`,
-      portalsStored: Object.keys(portalTokens).length,
+        "Installed OK. Configure Bitrix Outbound Webhook to POST events to /bitrix/events.",
+      handler: handlerUrl,
     });
   } catch (e) {
     console.error("❌ INSTALL error:", e);
@@ -176,238 +179,222 @@ app.post("/bitrix/install", (req, res) => {
   }
 });
 
-/**
- * EVENTS endpoint — Bitrix OUTGOING webhook posts here.
- *
- * Bitrix payload can vary. Common patterns:
- * - req.body.event + req.body.data
- * - req.body.EVENT + req.body.DATA
- *
- * We attempt to normalize into:
- *   eventName, data, callId, direction, agentId, phone, lineName
- */
+// -------------------- EVENTS ENDPOINT --------------------
+// Bitrix Outbound Webhook -> POST /bitrix/events
 app.post("/bitrix/events", (req, res) => {
-  // Respond fast so Bitrix doesn't retry
+  // Respond fast (Bitrix expects quick ack)
   res.json({ ok: true });
 
-  try {
-    // Optional security check (only if you add and use it)
-    // Bitrix outgoing webhooks can send a key in query or header depending on your setup.
-    // If you want to enforce it:
-    //
-    // const SECRET = process.env.BITRIX_WEBHOOK_SECRET;
-    // if (SECRET) {
-    //   const provided = req.query.secret || req.headers["x-bitrix-secret"];
-    //   if (provided !== SECRET) {
-    //     console.warn("⚠️ Webhook rejected: bad secret");
-    //     return;
-    //   }
-    // }
+  // Optional validation if Bitrix includes "auth[application_token]" or "auth[application_token]" style token
+  // Your outbound webhook UI shows: "Application token"
+  // Bitrix sometimes sends it in req.body["auth[application_token]"] or req.body.auth?.application_token
+  if (BITRIX_OUTBOUND_TOKEN) {
+    const token1 = req.body?.auth?.application_token;
+    const token2 = req.body["auth[application_token]"];
+    const got = token1 || token2;
 
-    const raw = req.body || {};
-    const eventName = raw.event || raw.EVENT || "unknown";
-    const data = raw.data || raw.DATA || raw;
-
-    console.log("📨 EVENT received:", eventName);
-
-    // Try to find callId from typical Bitrix Voximplant payload structures
-    const callId =
-      data.callId ||
-      data.CALL_ID ||
-      (data.CALL && (data.CALL.callId || data.CALL.CALL_ID)) ||
-      data.call_id ||
-      raw.callId ||
-      raw.CALL_ID ||
-      null;
-
-    // Determine direction (IN/OUT) best-effort
-    const direction =
-      data.direction ||
-      data.DIRECTION ||
-      (data.CALL && (data.CALL.direction || data.CALL.DIRECTION)) ||
-      (data.call && (data.call.direction || data.call.DIRECTION)) ||
-      null;
-
-    // Agent info (best-effort)
-    const agentId =
-      data.agentId ||
-      data.AGENT_ID ||
-      data.userId ||
-      data.USER_ID ||
-      (data.CALL && (data.CALL.agentId || data.CALL.userId || data.CALL.USER_ID)) ||
-      null;
-
-    const agentName =
-      data.agentName ||
-      data.AGENT_NAME ||
-      (data.USER && data.USER.NAME) ||
-      null;
-
-    // Caller/line info (best-effort)
-    const phone =
-      data.phoneNumber ||
-      data.PHONE_NUMBER ||
-      data.phone ||
-      data.PHONE ||
-      (data.CALL && (data.CALL.phoneNumber || data.CALL.phone || data.CALL.PHONE)) ||
-      null;
-
-    const lineName =
-      data.lineName ||
-      data.LINE_NAME ||
-      data.queueName ||
-      data.QUEUE_NAME ||
-      (data.CALL && (data.CALL.lineName || data.CALL.queueName)) ||
-      null;
-
-    // If no callId, just log and exit
-    if (!callId) {
-      console.log("⚠️ No callId found in payload; ignoring metrics update.");
-      return;
+    if (!got || String(got) !== BITRIX_OUTBOUND_TOKEN) {
+      console.warn("⚠️ Webhook token mismatch (event accepted but ignored).");
+      console.warn("Expected:", BITRIX_OUTBOUND_TOKEN);
+      console.warn("Got:", got);
+      return; // ignore processing
     }
-
-    // Normalize direction to IN/OUT if possible
-    let dir = null;
-    if (direction) {
-      const d = String(direction).toUpperCase();
-      if (d.includes("IN")) dir = "IN";
-      if (d.includes("OUT")) dir = "OUT";
-    }
-
-    // If still unknown, keep last known direction if call exists
-    const existing = liveCalls.get(callId);
-    if (!dir && existing && existing.direction) dir = existing.direction;
-    if (!dir) dir = "IN"; // safe fallback (you can change)
-
-    // Ensure agent record
-    const a = ensureAgent(agentId, agentName);
-
-    // -------------------- EVENT HANDLERS --------------------
-    if (eventName === "OnVoximplantCallInit") {
-      // Call is being created/initialized
-      if (!liveCalls.has(callId)) {
-        liveCalls.set(callId, {
-          callId,
-          direction: dir,
-          startedAt: nowISO(),
-          phone: phone || "",
-          lineName: lineName || "",
-          agentId: agentId || "",
-        });
-
-        if (dir === "IN") metrics.incoming.inProgress += 1;
-        else metrics.outgoing.inProgress += 1;
-
-        if (a) a.onCallNow = true;
-      }
-      return;
-    }
-
-    if (eventName === "OnVoximplantCallStart") {
-      // Call started ringing / dialing
-      // Ensure it's tracked
-      if (!liveCalls.has(callId)) {
-        liveCalls.set(callId, {
-          callId,
-          direction: dir,
-          startedAt: nowISO(),
-          phone: phone || "",
-          lineName: lineName || "",
-          agentId: agentId || "",
-        });
-        if (dir === "IN") metrics.incoming.inProgress += 1;
-        else metrics.outgoing.inProgress += 1;
-      }
-      if (a) a.onCallNow = true;
-      return;
-    }
-
-    if (eventName === "OnVoximplantCallConnected") {
-      // Call connected / answered
-      const lc = liveCalls.get(callId);
-      if (!lc) return;
-
-      // Reduce inProgress; count answered
-      if (lc.direction === "IN") {
-        clampDown(metrics.incoming, "inProgress");
-        metrics.incoming.answered += 1;
-        if (a) a.inboundAnswered += 1;
-      } else {
-        clampDown(metrics.outgoing, "inProgress");
-        metrics.outgoing.answered += 1;
-        if (a) a.outboundAnswered += 1;
-      }
-      if (a) a.onCallNow = true;
-      return;
-    }
-
-    if (eventName === "OnVoximplantCallEnd") {
-      // Call ended — determine missed/cancelled best-effort
-      const lc = liveCalls.get(callId);
-      if (!lc) return;
-
-      const lcAgent = ensureAgent(lc.agentId, agentName);
-
-      // If it never connected, count as missed/cancelled.
-      // We don’t have definitive status fields across all payloads,
-      // so treat end without "connected" marker as missed/cancelled.
-      //
-      // You can refine later by reading data.status, data.callStatus, etc.
-      const connectedFlag =
-        data.connected ||
-        data.CONNECTED ||
-        data.isConnected ||
-        data.IS_CONNECTED ||
-        false;
-
-      if (lc.direction === "IN") {
-        clampDown(metrics.incoming, "inProgress");
-
-        // if no explicit connected => count missed
-        if (!connectedFlag) {
-          metrics.incoming.missed += 1;
-          metrics.missedDroppedAbandoned += 1;
-          if (lcAgent) lcAgent.inboundMissed += 1;
-        }
-      } else {
-        clampDown(metrics.outgoing, "inProgress");
-
-        // if no explicit connected => count cancelled/missed
-        if (!connectedFlag) {
-          metrics.outgoing.cancelled += 1;
-          if (lcAgent) lcAgent.outboundMissed += 1;
-        }
-      }
-
-      if (lcAgent) lcAgent.onCallNow = false;
-
-      liveCalls.delete(callId);
-      return;
-    }
-
-    // Unknown event — no-op
-  } catch (e) {
-    console.error("❌ /bitrix/events handler error:", e.message);
   }
+
+  console.log("✅ OUTBOUND WEBHOOK HIT:", new Date().toISOString());
+  console.log("Headers:", req.headers);
+  console.log("Body:", req.body);
+
+  const eventRaw = req.body.event || req.body.EVENT || req.body?.data?.EVENT;
+  const eventName = normalizeEventName(eventRaw);
+
+  // Keep last events for debugging
+  pushLastEvent({
+    at: new Date().toISOString(),
+    eventRaw,
+    eventName,
+    body: req.body,
+  });
+
+  // --- Extract common fields (Bitrix payload can vary) ---
+  // Try multiple shapes to locate callId and direction/agent
+  const data = req.body.data || req.body.DATA || req.body;
+
+  const callId =
+    data.callId ||
+    data.CALL_ID ||
+    data?.PARAMS?.CALL_ID ||
+    data?.FIELDS?.CALL_ID ||
+    data?.FIELDS?.callId ||
+    data?.call?.id ||
+    data?.CALLID ||
+    null;
+
+  // direction may appear as IN/OUT or inbound/outbound; depends on event.
+  const directionRaw =
+    data.direction ||
+    data.DIRECTION ||
+    data?.PARAMS?.DIRECTION ||
+    data?.FIELDS?.DIRECTION ||
+    data?.FIELDS?.direction ||
+    null;
+
+  const directionNorm = directionRaw
+    ? String(directionRaw).toUpperCase()
+    : null;
+
+  const agentId =
+    data.agentId ||
+    data.AGENT_ID ||
+    data?.PARAMS?.PORTAL_USER_ID ||
+    data?.PARAMS?.USER_ID ||
+    data?.FIELDS?.PORTAL_USER_ID ||
+    data?.FIELDS?.USER_ID ||
+    null;
+
+  // --- Event mapping based on your outbound webhook selection ---
+  // You selected:
+  // - Phone call started (ONVOXIMPLANTCALLINIT)
+  // - Phone call answered (ONVOXIMPLANTCALLSTART)
+  // - Phone call finished (ONVOXIMPLANTCALLEND)
+  //
+  
+  // The above got silly due to copy safety—let’s do it properly:
+  const isInit2 =
+    eventName === "ONVOXIMPLANTCALLINIT" || eventName === "ONVOXIMPLANTCALLINIT".toUpperCase();
+  const isAnswered =
+    eventName === "ONVOXIMPLANTCALLSTART" || eventName === "ONVOXIMPLANTCALLSTART".toUpperCase();
+  const isEnd =
+    eventName === "ONVOXIMPLANTCALLEND" || eventName === "ONVOXIMPLANTCALLEND".toUpperCase();
+
+  // If Bitrix sends camel-case names in event, also support:
+  const camel = String(eventRaw || "").trim();
+  const isInitCamel = camel === "OnVoximplantCallInit";
+  const isAnsweredCamel = camel === "OnVoximplantCallStart";
+  const isEndCamel = camel === "OnVoximplantCallEnd";
+
+  const isInitFinal = isInit2 || isInitCamel;
+  const isAnsweredFinal = isAnswered || isAnsweredCamel;
+  const isEndFinal = isEnd || isEndCamel;
+
+  // Determine direction
+  // If not provided, we guess: phone call events are usually inbound unless Bitrix indicates OUT
+  const dir =
+    directionNorm === "OUT" || directionNorm === "OUTBOUND"
+      ? "OUT"
+      : "IN";
+
+  if (!callId) {
+    console.warn("⚠️ No callId found in payload; skipping metrics update.");
+    return;
+  }
+
+  // ------------------- Metrics Logic -------------------
+  // INIT: call created / ringing -> inProgress++
+  if (isInitFinal) {
+    liveCalls.set(callId, { direction: dir, agentId, startedAt: Date.now() });
+    if (dir === "IN") metrics.incoming.inProgress += 1;
+    else metrics.outgoing.inProgress += 1;
+
+    const a = ensureAgent(agentId);
+    if (a) a.onCallNow = true;
+
+    console.log("📞 CALL INIT:", callId, "dir:", dir, "agent:", agentId);
+    return;
+  }
+
+  // START (answered): move from inProgress to answered
+  if (isAnsweredFinal) {
+    const lc = liveCalls.get(callId);
+    if (!lc) {
+      // If we missed INIT, create one
+      liveCalls.set(callId, { direction: dir, agentId, startedAt: Date.now() });
+    }
+    if (dir === "IN") {
+      clampDown(metrics.incoming, "inProgress");
+      metrics.incoming.answered += 1;
+    } else {
+      clampDown(metrics.outgoing, "inProgress");
+      metrics.outgoing.answered += 1;
+    }
+    const a = ensureAgent(agentId);
+    if (a) a.onCallNow = true;
+
+    console.log("✅ CALL ANSWERED:", callId, "dir:", dir, "agent:", agentId);
+    return;
+  }
+
+  // END: finished -> decrement inProgress if still there, otherwise classify as missed/cancelled
+  if (isEndFinal) {
+    const lc = liveCalls.get(callId) || { direction: dir, agentId };
+
+    // If call ends without being answered, count missed/cancelled
+    // NOTE: This is basic logic; you can refine using status fields if present.
+    if (lc.direction === "IN") {
+      // If it was still in progress (ringing) and ended -> missed
+      if (metrics.incoming.inProgress > 0) {
+        clampDown(metrics.incoming, "inProgress");
+        metrics.incoming.missed += 1;
+        metrics.missedDroppedAbandoned += 1;
+
+        const a = ensureAgent(lc.agentId);
+        if (a) a.inboundMissed += 1;
+      } else {
+        // If it was answered already, we just mark agent off call (nothing else)
+      }
+    } else {
+      // outbound
+      if (metrics.outgoing.inProgress > 0) {
+        clampDown(metrics.outgoing, "inProgress");
+        metrics.outgoing.cancelled += 1;
+
+        const a = ensureAgent(lc.agentId);
+        if (a) a.outboundMissed += 1;
+      } else {
+        // was answered already, nothing else
+      }
+    }
+
+    const a = ensureAgent(lc.agentId);
+    if (a) a.onCallNow = false;
+
+    liveCalls.delete(callId);
+
+    console.log("🛑 CALL END:", callId, "dir:", lc.direction, "agent:", lc.agentId);
+    return;
+  }
+
+  console.log("ℹ️ Unhandled event:", eventRaw);
 });
 
-// Debug state
+// Helpful message for GET on /bitrix/events
+app.get("/bitrix/events", (req, res) => {
+  res
+    .status(405)
+    .type("text/plain")
+    .send("Method Not Allowed. Use POST /bitrix/events");
+});
+
+// -------------------- Debug --------------------
+app.get("/health", (req, res) => res.json({ ok: true }));
+
 app.get("/debug/state", (req, res) => {
   res.json({
     ok: true,
     portalsStored: Object.keys(portalTokens).length,
     tokensFile: TOKENS_FILE,
+    handler: handlerUrl,
     metrics,
-    liveCalls: Array.from(liveCalls.values()),
+    liveCalls: Array.from(liveCalls.entries()).map(([id, v]) => ({ callId: id, ...v })),
     agents: Array.from(agents.values()),
   });
 });
 
+app.get("/debug/last-events", (req, res) => {
+  res.json({ ok: true, count: lastEvents.length, lastEvents });
+});
 
-// -------------------- LISTEN --------------------
-// IMPORTANT: only ONE listen. Railway must see this port open.
-server.listen(PORT, "0.0.0.0", () => {
+// -------------------- Listen --------------------
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on ${PORT}`);
-  
-
-setInterval(() => console.log("🫀 alive", new Date().toISOString()), 30000);
+});
