@@ -31,7 +31,7 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").trim();
 
 // Persist tokens/portal info
-const DATA_DIR = (process.env.DATA_DIR || "/data").trim();
+const DATA_DIR = (process.env.DATA_DIR || "./data").trim(); // Changed from /data to ./data for Railway compatibility
 const TOKENS_FILE = path.join(DATA_DIR, "portalTokens.json");
 
 // Optional: Outbound webhook token (if you want to validate source)
@@ -92,7 +92,7 @@ function normalizeEventName(raw) {
   // Many Bitrix outbound webhooks arrive like: ONVOXIMPLANTCALLINIT
   // Some older code may send: OnVoximplantCallInit
   // Normalize to uppercase token for comparisons:
-  return s.toUpperCase();
+  return s.toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
 function clampDown(obj, key) {
@@ -120,7 +120,7 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "2mb" }));
 
-// Simple “alive” heartbeat in logs (helps confirm container not sleeping)
+// Simple "alive" heartbeat in logs (helps confirm container not sleeping)
 setInterval(() => {
   console.log("🫀 alive", new Date().toISOString());
 }, 30_000);
@@ -202,8 +202,8 @@ app.post("/bitrix/events", (req, res) => {
   }
 
   console.log("✅ OUTBOUND WEBHOOK HIT:", new Date().toISOString());
-  console.log("Headers:", req.headers);
-  console.log("Body:", req.body);
+  console.log("Headers:", JSON.stringify(req.headers, null, 2));
+  console.log("Body:", JSON.stringify(req.body, null, 2));
 
   const eventRaw = req.body.event || req.body.EVENT || req.body?.data?.EVENT;
   const eventName = normalizeEventName(eventRaw);
@@ -257,28 +257,20 @@ app.post("/bitrix/events", (req, res) => {
   // - Phone call started (ONVOXIMPLANTCALLINIT)
   // - Phone call answered (ONVOXIMPLANTCALLSTART)
   // - Phone call finished (ONVOXIMPLANTCALLEND)
-  //
-  
-  // The above got silly due to copy safety—let’s do it properly:
-  const isInit2 =
-    eventName === "ONVOXIMPLANTCALLINIT" || eventName === "ONVOXIMPLANTCALLINIT".toUpperCase();
-  const isAnswered =
-    eventName === "ONVOXIMPLANTCALLSTART" || eventName === "ONVOXIMPLANTCALLSTART".toUpperCase();
-  const isEnd =
-    eventName === "ONVOXIMPLANTCALLEND" || eventName === "ONVOXIMPLANTCALLEND".toUpperCase();
+  const isInit = eventName === "ONVOXIMPLANTCALLINIT" || 
+                eventName.includes("CALLINIT");
+  const isAnswered = eventName === "ONVOXIMPLANTCALLSTART" || 
+                    eventName.includes("CALLSTART");
+  const isEnd = eventName === "ONVOXIMPLANTCALLEND" || 
+                eventName.includes("CALLEND");
 
-  // If Bitrix sends camel-case names in event, also support:
-  const camel = String(eventRaw || "").trim();
-  const isInitCamel = camel === "OnVoximplantCallInit";
-  const isAnsweredCamel = camel === "OnVoximplantCallStart";
-  const isEndCamel = camel === "OnVoximplantCallEnd";
-
-  const isInitFinal = isInit2 || isInitCamel;
-  const isAnsweredFinal = isAnswered || isAnsweredCamel;
-  const isEndFinal = isEnd || isEndCamel;
+  // Also support camelCase if provided in eventRaw
+  const camelEvent = String(eventRaw || "").trim();
+  const isInitFinal = isInit || camelEvent === "OnVoximplantCallInit";
+  const isAnsweredFinal = isAnswered || camelEvent === "OnVoximplantCallStart";
+  const isEndFinal = isEnd || camelEvent === "OnVoximplantCallEnd";
 
   // Determine direction
-  // If not provided, we guess: phone call events are usually inbound unless Bitrix indicates OUT
   const dir =
     directionNorm === "OUT" || directionNorm === "OUTBOUND"
       ? "OUT"
@@ -289,12 +281,23 @@ app.post("/bitrix/events", (req, res) => {
     return;
   }
 
+  console.log(`📞 Event: ${eventName} (${camelEvent}) | Call: ${callId} | Dir: ${dir} | Agent: ${agentId}`);
+
   // ------------------- Metrics Logic -------------------
   // INIT: call created / ringing -> inProgress++
   if (isInitFinal) {
-    liveCalls.set(callId, { direction: dir, agentId, startedAt: Date.now() });
-    if (dir === "IN") metrics.incoming.inProgress += 1;
-    else metrics.outgoing.inProgress += 1;
+    liveCalls.set(callId, { 
+      direction: dir, 
+      agentId, 
+      startedAt: Date.now(),
+      event: eventName 
+    });
+    
+    if (dir === "IN") {
+      metrics.incoming.inProgress += 1;
+    } else {
+      metrics.outgoing.inProgress += 1;
+    }
 
     const a = ensureAgent(agentId);
     if (a) a.onCallNow = true;
@@ -308,8 +311,14 @@ app.post("/bitrix/events", (req, res) => {
     const lc = liveCalls.get(callId);
     if (!lc) {
       // If we missed INIT, create one
-      liveCalls.set(callId, { direction: dir, agentId, startedAt: Date.now() });
+      liveCalls.set(callId, { 
+        direction: dir, 
+        agentId, 
+        startedAt: Date.now(),
+        event: eventName 
+      });
     }
+    
     if (dir === "IN") {
       clampDown(metrics.incoming, "inProgress");
       metrics.incoming.answered += 1;
@@ -317,6 +326,7 @@ app.post("/bitrix/events", (req, res) => {
       clampDown(metrics.outgoing, "inProgress");
       metrics.outgoing.answered += 1;
     }
+    
     const a = ensureAgent(agentId);
     if (a) a.onCallNow = true;
 
@@ -326,32 +336,48 @@ app.post("/bitrix/events", (req, res) => {
 
   // END: finished -> decrement inProgress if still there, otherwise classify as missed/cancelled
   if (isEndFinal) {
-    const lc = liveCalls.get(callId) || { direction: dir, agentId };
+    const lc = liveCalls.get(callId) || { 
+      direction: dir, 
+      agentId 
+    };
 
     // If call ends without being answered, count missed/cancelled
-    // NOTE: This is basic logic; you can refine using status fields if present.
+    // Check if call was still in progress (not answered)
+    const wasInProgress = 
+      (lc.direction === "IN" && metrics.incoming.inProgress > 0) ||
+      (lc.direction === "OUT" && metrics.outgoing.inProgress > 0);
+
     if (lc.direction === "IN") {
-      // If it was still in progress (ringing) and ended -> missed
-      if (metrics.incoming.inProgress > 0) {
+      if (wasInProgress) {
+        // Call ended while ringing (missed)
         clampDown(metrics.incoming, "inProgress");
         metrics.incoming.missed += 1;
         metrics.missedDroppedAbandoned += 1;
 
         const a = ensureAgent(lc.agentId);
         if (a) a.inboundMissed += 1;
+        
+        console.log("❌ CALL MISSED (inbound):", callId, "agent:", lc.agentId);
       } else {
-        // If it was answered already, we just mark agent off call (nothing else)
+        // Call was answered, now ending normally
+        clampDown(metrics.incoming, "answered");
+        console.log("📞 CALL ENDED (inbound):", callId, "agent:", lc.agentId);
       }
     } else {
-      // outbound
-      if (metrics.outgoing.inProgress > 0) {
+      // OUTBOUND
+      if (wasInProgress) {
+        // Outbound call cancelled before answer
         clampDown(metrics.outgoing, "inProgress");
         metrics.outgoing.cancelled += 1;
 
         const a = ensureAgent(lc.agentId);
         if (a) a.outboundMissed += 1;
+        
+        console.log("❌ CALL CANCELLED (outbound):", callId, "agent:", lc.agentId);
       } else {
-        // was answered already, nothing else
+        // Outbound call answered and now ending
+        clampDown(metrics.outgoing, "answered");
+        console.log("📞 CALL ENDED (outbound):", callId, "agent:", lc.agentId);
       }
     }
 
@@ -359,12 +385,10 @@ app.post("/bitrix/events", (req, res) => {
     if (a) a.onCallNow = false;
 
     liveCalls.delete(callId);
-
-    console.log("🛑 CALL END:", callId, "dir:", lc.direction, "agent:", lc.agentId);
     return;
   }
 
-  console.log("ℹ️ Unhandled event:", eventRaw);
+  console.log("ℹ️ Unhandled event:", eventRaw, "| Normalized:", eventName);
 });
 
 // Helpful message for GET on /bitrix/events
@@ -396,5 +420,5 @@ app.get("/debug/last-events", (req, res) => {
 
 // -------------------- Listen --------------------
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
