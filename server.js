@@ -146,6 +146,21 @@ function ensureAgent(agentId) {
   return agents.get(agentId);
 }
 
+function ensureAgent(agentId) {
+  const id = String(agentId);
+  if (!id) return null;
+  if (!agents.has(id)) {
+    agents.set(id, {
+      id,
+      name: "",
+      onCallNow: false,
+      inboundMissed: 0,
+      outboundMissed: 0,
+    });
+  }
+  return agents.get(id);
+}
+
 // -------------------- App --------------------
 const app = express();
 
