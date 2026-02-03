@@ -146,21 +146,6 @@ function ensureAgent(agentId) {
   return agents.get(agentId);
 }
 
-function ensureAgent(agentId) {
-  const id = String(agentId);
-  if (!id) return null;
-  if (!agents.has(id)) {
-    agents.set(id, {
-      id,
-      name: "",
-      onCallNow: false,
-      inboundMissed: 0,
-      outboundMissed: 0,
-    });
-  }
-  return agents.get(id);
-}
-
 // -------------------- App --------------------
 const app = express();
 
@@ -168,7 +153,7 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "2mb" }));
 
-// Simple “alive” heartbeat in logs (helps confirm container not sleeping)
+// Simple "alive" heartbeat in logs (helps confirm container not sleeping)
 setInterval(() => {
   console.log("🫀 alive", new Date().toISOString());
 }, 30_000);
@@ -186,7 +171,7 @@ const handlerUrl =
 console.log("🔗 Handler URL:", handlerUrl);
 
 // Root
-("/", (req, res) => {
+app.get("/", (req, res) => {
   res.type("text/plain").send("Bitrix24 Wallboard Backend is running.");
 });
 
@@ -228,7 +213,6 @@ app.post("/bitrix/install", (req, res) => {
 });
 
 // -------------------- EVENTS ENDPOINT --------------------
-// ---------- EVENTS ENDPOINT (Bitrix will POST here) ----------
 let lastEvent = null;
 
 app.post("/bitrix/events", (req, res) => {
@@ -236,13 +220,8 @@ app.post("/bitrix/events", (req, res) => {
   res.json({ ok: true });
 
   // Keep a copy for debugging
-app.get("/debug/last-event", (req, res) => {
-  res.json({ ok: true, lastEvent });
-});
-
-  
   lastEvent = req.body;
-
+  
   const eventName = pickEventName(req.body);
   const data = pickEventData(req.body);
 
@@ -323,7 +302,7 @@ app.get("/debug/last-event", (req, res) => {
     else metrics.outgoing.inProgress += 1;
   }
 
-  // Update with latest info (don’t overwrite non-empty values with empty)
+  // Update with latest info (don't overwrite non-empty values with empty)
   if (from) lc.from = from;
   if (to) lc.to = to;
   if (direction) lc.direction = direction;
@@ -380,10 +359,12 @@ app.get("/debug/last-event", (req, res) => {
     // remove call from live list
     liveCalls.delete(callId);
   }
-
-  broadcast();
 });
 
+// Debug endpoint for last event
+app.get("/debug/last-event", (req, res) => {
+  res.json({ ok: true, lastEvent });
+});
 
 // ---------- WALLBOARD UI (HTML) ----------
 app.get("/wallboard", (req, res) => {
@@ -417,6 +398,7 @@ app.get("/debug/state", (req, res) => {
 app.get("/debug/last-events", (req, res) => {
   res.json({ ok: true, count: lastEvents.length, lastEvents });
 });
+
 function getWallboardHtml() {
   return `<!doctype html>
 <html lang="en">
@@ -662,7 +644,7 @@ function getWallboardHtml() {
       </div>
       <div class="content">
         <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-          <div class="small">Calls in progress (if you’re tracking live calls)</div>
+          <div class="small">Calls in progress (if you're tracking live calls)</div>
           <div class="small mono" id="uptime"></div>
         </div>
         <table>
@@ -681,7 +663,7 @@ function getWallboardHtml() {
 
         <div style="height:12px"></div>
 
-        <div class="small" style="margin-bottom:8px;">Agents (if you’re tracking agents)</div>
+        <div class="small" style="margin-bottom:8px;">Agents (if you're tracking agents)</div>
         <table>
           <thead>
             <tr>
