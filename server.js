@@ -49,6 +49,39 @@ const metrics = {
 };
 const liveCalls = new Map(); // callId -> {direction, agentId, ...}
 const agents = new Map(); // agentId -> { onCallNow, inboundMissed, outboundMissed, ... }
+function pickEventName(body) {
+  return (
+    body?.event ||
+    body?.EVENT ||
+    body?.type ||
+    body?.TYPE ||
+    body?.eventName ||
+    "unknown"
+  );
+}
+
+function pickEventData(body) {
+  return body?.data || body?.DATA || body?.payload || body?.PAYLOAD || {};
+}
+
+// Bitrix outbound webhooks use event names like:
+// ONVOXIMPLANTCALLINIT, ONVOXIMPLANTCALLSTART, ONVOXIMPLANTCALLEND
+function isInitEvent(e) {
+  const x = String(e || "").toUpperCase();
+  return x.includes("ONVOXIMPLANTCALLINIT") || x.includes("CALLINIT");
+}
+function isStartEvent(e) {
+  const x = String(e || "").toUpperCase();
+  return x.includes("ONVOXIMPLANTCALLSTART") || x.includes("CALLSTART");
+}
+function isEndEvent(e) {
+  const x = String(e || "").toUpperCase();
+  return x.includes("ONVOXIMPLANTCALLEND") || x.includes("CALLEND");
+}
+
+function wasAnswered(lc) {
+  return String(lc?.status || "").toUpperCase().includes("ANSWER");
+}
 
 // -------------------- Helpers --------------------
 function ensureDir(dir) {
@@ -180,192 +213,162 @@ app.post("/bitrix/install", (req, res) => {
 });
 
 // -------------------- EVENTS ENDPOINT --------------------
-// Bitrix Outbound Webhook -> POST /bitrix/events
+// ---------- EVENTS ENDPOINT (Bitrix will POST here) ----------
+let lastEvent = null;
+
 app.post("/bitrix/events", (req, res) => {
-  // Respond fast (Bitrix expects quick ack)
+  // Respond fast
   res.json({ ok: true });
 
-  // Optional validation if Bitrix includes "auth[application_token]" or "auth[application_token]" style token
-  // Your outbound webhook UI shows: "Application token"
-  // Bitrix sometimes sends it in req.body["auth[application_token]"] or req.body.auth?.application_token
-  if (BITRIX_OUTBOUND_TOKEN) {
-    const token1 = req.body?.auth?.application_token;
-    const token2 = req.body["auth[application_token]"];
-    const got = token1 || token2;
+  // Keep a copy for debugging
+app.get("/debug/last-event", (req, res) => {
+  res.json({ ok: true, lastEvent });
+});
 
-    if (!got || String(got) !== BITRIX_OUTBOUND_TOKEN) {
-      console.warn("⚠️ Webhook token mismatch (event accepted but ignored).");
-      console.warn("Expected:", BITRIX_OUTBOUND_TOKEN);
-      console.warn("Got:", got);
-      return; // ignore processing
-    }
-  }
-
-  console.log("✅ OUTBOUND WEBHOOK HIT:", new Date().toISOString());
-  console.log("Headers:", req.headers);
-  console.log("Body:", req.body);
-
-  const eventRaw = req.body.event || req.body.EVENT || req.body?.data?.EVENT;
-  const eventName = normalizeEventName(eventRaw);
-
-  // Keep last events for debugging
-  pushLastEvent({
-    at: new Date().toISOString(),
-    eventRaw,
-    eventName,
-    body: req.body,
-  });
-
-  // --- Extract common fields (Bitrix payload can vary) ---
-  // Try multiple shapes to locate callId and direction/agent
-  const data = req.body.data || req.body.DATA || req.body;
-
-  const callId =
-    data.callId ||
-    data.CALL_ID ||
-    data?.PARAMS?.CALL_ID ||
-    data?.FIELDS?.CALL_ID ||
-    data?.FIELDS?.callId ||
-    data?.call?.id ||
-    data?.CALLID ||
-    null;
-
-  // direction may appear as IN/OUT or inbound/outbound; depends on event.
-  const directionRaw =
-    data.direction ||
-    data.DIRECTION ||
-    data?.PARAMS?.DIRECTION ||
-    data?.FIELDS?.DIRECTION ||
-    data?.FIELDS?.direction ||
-    null;
-
-  const directionNorm = directionRaw
-    ? String(directionRaw).toUpperCase()
-    : null;
-
-  const agentId =
-    data.agentId ||
-    data.AGENT_ID ||
-    data?.PARAMS?.PORTAL_USER_ID ||
-    data?.PARAMS?.USER_ID ||
-    data?.FIELDS?.PORTAL_USER_ID ||
-    data?.FIELDS?.USER_ID ||
-    null;
-
-  // --- Event mapping based on your outbound webhook selection ---
-  // You selected:
-  // - Phone call started (ONVOXIMPLANTCALLINIT)
-  // - Phone call answered (ONVOXIMPLANTCALLSTART)
-  // - Phone call finished (ONVOXIMPLANTCALLEND)
-  //
   
-  // The above got silly due to copy safety—let’s do it properly:
-  const isInit2 =
-    eventName === "ONVOXIMPLANTCALLINIT" || eventName === "ONVOXIMPLANTCALLINIT".toUpperCase();
-  const isAnswered =
-    eventName === "ONVOXIMPLANTCALLSTART" || eventName === "ONVOXIMPLANTCALLSTART".toUpperCase();
-  const isEnd =
-    eventName === "ONVOXIMPLANTCALLEND" || eventName === "ONVOXIMPLANTCALLEND".toUpperCase();
+  lastEvent = req.body;
 
-  // If Bitrix sends camel-case names in event, also support:
-  const camel = String(eventRaw || "").trim();
-  const isInitCamel = camel === "OnVoximplantCallInit";
-  const isAnsweredCamel = camel === "OnVoximplantCallStart";
-  const isEndCamel = camel === "OnVoximplantCallEnd";
+  const eventName = pickEventName(req.body);
+  const data = pickEventData(req.body);
 
-  const isInitFinal = isInit2 || isInitCamel;
-  const isAnsweredFinal = isAnswered || isAnsweredCamel;
-  const isEndFinal = isEnd || isEndCamel;
+  console.log("📨 EVENT:", eventName, "| keys:", Object.keys(data || {}));
 
-  // Determine direction
-  // If not provided, we guess: phone call events are usually inbound unless Bitrix indicates OUT
-  const dir =
-    directionNorm === "OUT" || directionNorm === "OUTBOUND"
-      ? "OUT"
-      : "IN";
+  // Extract call id + phone fields as best-effort across payload variations
+  const callId =
+    data.CALL_ID ||
+    data.callId ||
+    data.id ||
+    data.ID ||
+    data.CALL_ID_EXTERNAL ||
+    data.EXTERNAL_CALL_ID;
 
   if (!callId) {
-    console.warn("⚠️ No callId found in payload; skipping metrics update.");
+    console.log("⚠️ No CALL_ID found. Add /debug/last-event to inspect payload.");
     return;
   }
 
-  // ------------------- Metrics Logic -------------------
-  // INIT: call created / ringing -> inProgress++
-  if (isInitFinal) {
-    liveCalls.set(callId, { direction: dir, agentId, startedAt: Date.now() });
-    if (dir === "IN") metrics.incoming.inProgress += 1;
+  const from =
+    data.PHONE_NUMBER ||
+    data.PHONE ||
+    data.CALLER_ID ||
+    data.CALLER ||
+    data.FROM ||
+    data.from ||
+    "";
+
+  const to =
+    data.LINE_NUMBER ||
+    data.LINE ||
+    data.TO ||
+    data.to ||
+    data.DESTINATION ||
+    "";
+
+  // Agent / user handling the call (Bitrix often sends USER_ID / PORTAL_USER_ID)
+  const agentId =
+    data.USER_ID ||
+    data.PORTAL_USER_ID ||
+    data.AGENT_ID ||
+    data.agentId ||
+    null;
+
+  // Direction (best effort)
+  const directionRaw =
+    data.DIRECTION ||
+    data.direction ||
+    data.CALL_DIRECTION ||
+    "";
+
+  const direction =
+    String(directionRaw).toUpperCase().includes("OUT") ? "OUT" : "IN";
+
+  // Status/state fields (best effort)
+  const status =
+    data.STATUS ||
+    data.status ||
+    data.STATE ||
+    data.state ||
+    eventName;
+
+  // Ensure live call exists
+  let lc = liveCalls.get(callId);
+  if (!lc) {
+    lc = {
+      callId,
+      direction,
+      from,
+      to,
+      status: "INIT",
+      agentId: null,
+      startedAt: Date.now(),
+    };
+    liveCalls.set(callId, lc);
+
+    if (direction === "IN") metrics.incoming.inProgress += 1;
     else metrics.outgoing.inProgress += 1;
-
-    const a = ensureAgent(agentId);
-    if (a) a.onCallNow = true;
-
-    console.log("📞 CALL INIT:", callId, "dir:", dir, "agent:", agentId);
-    return;
   }
 
-  // START (answered): move from inProgress to answered
-  if (isAnsweredFinal) {
-    const lc = liveCalls.get(callId);
-    if (!lc) {
-      // If we missed INIT, create one
-      liveCalls.set(callId, { direction: dir, agentId, startedAt: Date.now() });
-    }
-    if (dir === "IN") {
-      clampDown(metrics.incoming, "inProgress");
-      metrics.incoming.answered += 1;
-    } else {
-      clampDown(metrics.outgoing, "inProgress");
-      metrics.outgoing.answered += 1;
-    }
-    const a = ensureAgent(agentId);
-    if (a) a.onCallNow = true;
+  // Update with latest info (don’t overwrite non-empty values with empty)
+  if (from) lc.from = from;
+  if (to) lc.to = to;
+  if (direction) lc.direction = direction;
+  if (agentId) lc.agentId = String(agentId);
+  lc.status = String(status);
 
-    console.log("✅ CALL ANSWERED:", callId, "dir:", dir, "agent:", agentId);
-    return;
+  // Update agent state (if we have agent)
+  if (lc.agentId) {
+    const a = ensureAgent(lc.agentId);
+    a.onCallNow = !isEndEvent(eventName);
+    a.name = a.name || `Agent ${lc.agentId}`;
   }
 
-  // END: finished -> decrement inProgress if still there, otherwise classify as missed/cancelled
-  if (isEndFinal) {
-    const lc = liveCalls.get(callId) || { direction: dir, agentId };
+  // Interpret key call events (map Bitrix webhook event names)
+  if (isInitEvent(eventName)) {
+    // still ringing/initial
+    lc.status = "RINGING";
+  }
 
-    // If call ends without being answered, count missed/cancelled
-    // NOTE: This is basic logic; you can refine using status fields if present.
+  if (isStartEvent(eventName)) {
+    // answered
+    lc.status = "ANSWERED";
+    if (lc.direction === "IN") metrics.incoming.answered += 1;
+    else metrics.outgoing.answered += 1;
+  }
+
+  if (isEndEvent(eventName)) {
+    // finished
+    lc.status = "ENDED";
+
+    // decrement inProgress
+    if (lc.direction === "IN") clampDown(metrics.incoming, "inProgress");
+    else clampDown(metrics.outgoing, "inProgress");
+
+    // If never answered and ended => missed/cancelled
+    const neverAnswered = !wasAnswered(lc);
+
     if (lc.direction === "IN") {
-      // If it was still in progress (ringing) and ended -> missed
-      if (metrics.incoming.inProgress > 0) {
-        clampDown(metrics.incoming, "inProgress");
+      if (neverAnswered) {
         metrics.incoming.missed += 1;
         metrics.missedDroppedAbandoned += 1;
-
-        const a = ensureAgent(lc.agentId);
-        if (a) a.inboundMissed += 1;
-      } else {
-        // If it was answered already, we just mark agent off call (nothing else)
+        if (lc.agentId) ensureAgent(lc.agentId).inboundMissed += 1;
       }
     } else {
-      // outbound
-      if (metrics.outgoing.inProgress > 0) {
-        clampDown(metrics.outgoing, "inProgress");
+      if (neverAnswered) {
         metrics.outgoing.cancelled += 1;
-
-        const a = ensureAgent(lc.agentId);
-        if (a) a.outboundMissed += 1;
-      } else {
-        // was answered already, nothing else
+        if (lc.agentId) ensureAgent(lc.agentId).outboundMissed += 1;
       }
     }
 
-    const a = ensureAgent(lc.agentId);
-    if (a) a.onCallNow = false;
+    // agent no longer on call
+    if (lc.agentId) ensureAgent(lc.agentId).onCallNow = false;
 
+    // remove call from live list
     liveCalls.delete(callId);
-
-    console.log("🛑 CALL END:", callId, "dir:", lc.direction, "agent:", lc.agentId);
-    return;
   }
 
-  console.log("ℹ️ Unhandled event:", eventRaw);
+  broadcast();
 });
+
 
 // ---------- WALLBOARD UI (HTML) ----------
 app.get("/wallboard", (req, res) => {
