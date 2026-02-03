@@ -47,7 +47,7 @@ const metrics = {
   outgoing: { inProgress: 0, answered: 0, cancelled: 0 },
   missedDroppedAbandoned: 0,
 };
-const liveCalls = new Map(); // callId -> {direction, agentId, ...}
+const liveCalls = new Map(); // callId -> {direction, agentId, wasAnswered, ...}
 const agents = new Map(); // agentId -> { onCallNow, inboundMissed, outboundMissed, ... }
 function pickEventName(body) {
   return (
@@ -77,10 +77,6 @@ function isStartEvent(e) {
 function isEndEvent(e) {
   const x = String(e || "").toUpperCase();
   return x.includes("ONVOXIMPLANTCALLEND") || x.includes("CALLEND");
-}
-
-function wasAnswered(lc) {
-  return String(lc?.status || "").toUpperCase().includes("ANSWER");
 }
 
 // -------------------- Helpers --------------------
@@ -133,17 +129,100 @@ function clampDown(obj, key) {
   obj[key] = Math.max(0, obj[key] - 1);
 }
 
-function ensureAgent(agentId) {
+function ensureAgent(agentId, agentName = "") {
   if (!agentId) return null;
+  
   if (!agents.has(agentId)) {
     agents.set(agentId, {
       agentId,
+      name: agentName || `Agent ${agentId}`,
       onCallNow: false,
       inboundMissed: 0,
       outboundMissed: 0,
     });
+  } else if (agentName && agentName !== agents.get(agentId).name) {
+    // Update agent name if provided and different
+    const agent = agents.get(agentId);
+    agent.name = agentName;
   }
+  
   return agents.get(agentId);
+}
+
+// Function to extract caller number from various payload formats
+function extractCallerNumber(data) {
+  // Try different possible fields for caller number
+  const possibleFields = [
+    'PHONE_NUMBER',
+    'CALLER_ID',
+    'CALLER',
+    'FROM_NUMBER',
+    'FROM',
+    'from',
+    'phoneNumber',
+    'phone',
+    'PHONE',
+    'NUMBER',
+    'number',
+    'CALLER_NUMBER'
+  ];
+  
+  for (const field of possibleFields) {
+    if (data[field] && data[field].toString().trim()) {
+      return data[field].toString().trim();
+    }
+  }
+  
+  return ""; // Return empty if not found
+}
+
+// Function to extract agent/user name from payload
+function extractAgentName(data) {
+  // Try different possible fields for agent name
+  const possibleFields = [
+    'USER_NAME',
+    'USER_FULL_NAME',
+    'USER',
+    'AGENT_NAME',
+    'AGENT_FULL_NAME',
+    'agentName',
+    'agent_name',
+    'FULL_NAME',
+    'fullName',
+    'NAME',
+    'name'
+  ];
+  
+  for (const field of possibleFields) {
+    if (data[field] && data[field].toString().trim()) {
+      return data[field].toString().trim();
+    }
+  }
+  
+  return ""; // Return empty if not found
+}
+
+// Function to extract agent ID from payload
+function extractAgentId(data) {
+  // Try different possible fields for agent ID
+  const possibleFields = [
+    'USER_ID',
+    'PORTAL_USER_ID',
+    'AGENT_ID',
+    'agentId',
+    'agent_id',
+    'USER',
+    'user',
+    'userId'
+  ];
+  
+  for (const field of possibleFields) {
+    if (data[field] && data[field].toString().trim()) {
+      return data[field].toString().trim();
+    }
+  }
+  
+  return null;
 }
 
 // -------------------- App --------------------
@@ -226,6 +305,7 @@ app.post("/bitrix/events", (req, res) => {
   const data = pickEventData(req.body);
 
   console.log("📨 EVENT:", eventName, "| keys:", Object.keys(data || {}));
+  console.log("📊 Event data:", JSON.stringify(data, null, 2));
 
   // Extract call id + phone fields as best-effort across payload variations
   const callId =
@@ -234,43 +314,35 @@ app.post("/bitrix/events", (req, res) => {
     data.id ||
     data.ID ||
     data.CALL_ID_EXTERNAL ||
-    data.EXTERNAL_CALL_ID;
+    data.EXTERNAL_CALL_ID ||
+    data.externalCallId;
 
   if (!callId) {
     console.log("⚠️ No CALL_ID found. Add /debug/last-event to inspect payload.");
     return;
   }
 
-  const from =
-    data.PHONE_NUMBER ||
-    data.PHONE ||
-    data.CALLER_ID ||
-    data.CALLER ||
-    data.FROM ||
-    data.from ||
-    "";
-
+  // Use helper functions to extract data
+  const from = extractCallerNumber(data);
   const to =
     data.LINE_NUMBER ||
     data.LINE ||
     data.TO ||
     data.to ||
     data.DESTINATION ||
+    data.destination ||
     "";
 
-  // Agent / user handling the call (Bitrix often sends USER_ID / PORTAL_USER_ID)
-  const agentId =
-    data.USER_ID ||
-    data.PORTAL_USER_ID ||
-    data.AGENT_ID ||
-    data.agentId ||
-    null;
+  // Extract agent info
+  const agentId = extractAgentId(data);
+  const agentName = extractAgentName(data);
 
   // Direction (best effort)
   const directionRaw =
     data.DIRECTION ||
     data.direction ||
     data.CALL_DIRECTION ||
+    data.callDirection ||
     "";
 
   const direction =
@@ -293,7 +365,9 @@ app.post("/bitrix/events", (req, res) => {
       from,
       to,
       status: "INIT",
+      wasAnswered: false, // Track if call was ever answered
       agentId: null,
+      agentName: "",
       startedAt: Date.now(),
     };
     liveCalls.set(callId, lc);
@@ -306,55 +380,96 @@ app.post("/bitrix/events", (req, res) => {
   if (from) lc.from = from;
   if (to) lc.to = to;
   if (direction) lc.direction = direction;
-  if (agentId) lc.agentId = String(agentId);
+  
+  // Update agent info if available
+  if (agentId) {
+    lc.agentId = String(agentId);
+    if (agentName) {
+      lc.agentName = agentName;
+    }
+  }
+  
   lc.status = String(status);
 
   // Update agent state (if we have agent)
   if (lc.agentId) {
-    const a = ensureAgent(lc.agentId);
+    const a = ensureAgent(lc.agentId, lc.agentName || agentName);
     a.onCallNow = !isEndEvent(eventName);
-    a.name = a.name || `Agent ${lc.agentId}`;
+    
+    // Update agent name from the call data if available
+    if (lc.agentName && a.name !== lc.agentName) {
+      a.name = lc.agentName;
+    }
   }
 
   // Interpret key call events (map Bitrix webhook event names)
   if (isInitEvent(eventName)) {
     // still ringing/initial
     lc.status = "RINGING";
+    
+    // Log the incoming call details
+    console.log(`📞 ${direction === 'IN' ? 'Inbound' : 'Outbound'} call ${callId}: ${from || 'Unknown'} → ${to || 'Unknown'}`);
   }
 
   if (isStartEvent(eventName)) {
     // answered
     lc.status = "ANSWERED";
-    if (lc.direction === "IN") metrics.incoming.answered += 1;
-    else metrics.outgoing.answered += 1;
+    lc.wasAnswered = true; // Mark as answered
+    
+    // Log who answered the call
+    if (lc.agentId && lc.agentName) {
+      console.log(`✅ Call ${callId} answered by ${lc.agentName} (ID: ${lc.agentId})`);
+    } else if (lc.agentId) {
+      console.log(`✅ Call ${callId} answered by Agent ${lc.agentId}`);
+    } else {
+      console.log(`✅ Call ${callId} answered`);
+    }
+    
+    if (lc.direction === "IN") {
+      metrics.incoming.answered += 1;
+      // Decrement inProgress when answered (call is now active)
+      clampDown(metrics.incoming, "inProgress");
+    } else {
+      metrics.outgoing.answered += 1;
+      // Decrement inProgress when answered (call is now active)
+      clampDown(metrics.outgoing, "inProgress");
+    }
   }
 
   if (isEndEvent(eventName)) {
     // finished
     lc.status = "ENDED";
 
-    // decrement inProgress
-    if (lc.direction === "IN") clampDown(metrics.incoming, "inProgress");
-    else clampDown(metrics.outgoing, "inProgress");
+    // Decrement inProgress if not already decremented (for unanswered calls)
+    if (!lc.wasAnswered) {
+      if (lc.direction === "IN") clampDown(metrics.incoming, "inProgress");
+      else clampDown(metrics.outgoing, "inProgress");
+    }
 
-    // If never answered and ended => missed/cancelled
-    const neverAnswered = !wasAnswered(lc);
-
-    if (lc.direction === "IN") {
-      if (neverAnswered) {
+    // Handle missed/cancelled calls (only if never answered)
+    if (!lc.wasAnswered) {
+      if (lc.direction === "IN") {
         metrics.incoming.missed += 1;
         metrics.missedDroppedAbandoned += 1;
-        if (lc.agentId) ensureAgent(lc.agentId).inboundMissed += 1;
-      }
-    } else {
-      if (neverAnswered) {
+        if (lc.agentId) {
+          const agent = ensureAgent(lc.agentId, lc.agentName);
+          agent.inboundMissed += 1;
+        }
+      } else {
         metrics.outgoing.cancelled += 1;
-        if (lc.agentId) ensureAgent(lc.agentId).outboundMissed += 1;
+        if (lc.agentId) {
+          const agent = ensureAgent(lc.agentId, lc.agentName);
+          agent.outboundMissed += 1;
+        }
       }
+      
+      console.log(`❌ Call ${callId} ${lc.direction === 'IN' ? 'missed' : 'cancelled'} (never answered)`);
+    } else {
+      console.log(`📞 Call ${callId} ended (was answered)`);
     }
 
     // agent no longer on call
-    if (lc.agentId) ensureAgent(lc.agentId).onCallNow = false;
+    if (lc.agentId) ensureAgent(lc.agentId, lc.agentName).onCallNow = false;
 
     // remove call from live list
     liveCalls.delete(callId);
@@ -390,7 +505,16 @@ app.get("/debug/state", (req, res) => {
     tokensFile: TOKENS_FILE,
     handler: handlerUrl,
     metrics,
-    liveCalls: Array.from(liveCalls.entries()).map(([id, v]) => ({ callId: id, ...v })),
+    liveCalls: Array.from(liveCalls.entries()).map(([id, v]) => ({ 
+      callId: id, 
+      direction: v.direction,
+      from: v.from,
+      to: v.to,
+      status: v.status,
+      agentId: v.agentId,
+      agentName: v.agentName || `Agent ${v.agentId}`,
+      wasAnswered: v.wasAnswered
+    })),
     agents: Array.from(agents.values()),
   });
 });
@@ -653,11 +777,12 @@ function getWallboardHtml() {
               <th>Direction</th>
               <th>Caller / From</th>
               <th>To</th>
+              <th>Agent</th>
               <th>Status</th>
             </tr>
           </thead>
           <tbody id="callsBody">
-            <tr><td colspan="4" class="small muted">No active calls</td></tr>
+            <tr><td colspan="5" class="small muted">No active calls</td></tr>
           </tbody>
         </table>
 
@@ -735,18 +860,20 @@ function getWallboardHtml() {
     const calls = Array.isArray(liveCalls) ? liveCalls : [];
     els.liveCount.textContent = calls.length + " live calls";
     if(!calls.length){
-      els.callsBody.innerHTML = '<tr><td colspan="4" class="small muted">No active calls</td></tr>';
+      els.callsBody.innerHTML = '<tr><td colspan="5" class="small muted">No active calls</td></tr>';
       return;
     }
     els.callsBody.innerHTML = calls.map(c => {
       const dir = safeText(c.direction || c.dir || "");
-      const from = safeText(c.from || c.caller || c.CALLER || "");
-      const to = safeText(c.to || c.destination || c.TO || "");
+      const from = safeText(c.from || c.caller || c.CALLER || "Unknown");
+      const to = safeText(c.to || c.destination || c.TO || "Unknown");
+      const agent = safeText(c.agentName || c.agent || \`Agent \${c.agentId}\` || "No agent");
       const st = safeText(c.status || c.state || "");
       return \`<tr>
         <td>\${dir}</td>
         <td>\${from}</td>
         <td>\${to}</td>
+        <td>\${agent}</td>
         <td>\${st}</td>
       </tr>\`;
     }).join("");
@@ -759,7 +886,7 @@ function getWallboardHtml() {
       return;
     }
     els.agentsBody.innerHTML = a.map(x => {
-      const name = safeText(x.name || x.agentName || x.id || "");
+      const name = safeText(x.name || x.agentName || \`Agent \${x.agentId}\` || x.id || "");
       const onCall = !!(x.onCallNow || x.onCall);
       const status = onCall ? '<span class="tag"><span class="b good"></span>On Call</span>' : '<span class="tag"><span class="b warn"></span>Idle</span>';
       const inM = safeText(x.inboundMissed || 0);
