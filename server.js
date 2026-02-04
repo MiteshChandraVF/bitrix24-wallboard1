@@ -3,8 +3,8 @@
  * ------------------------------------------------
  * Key features:
  * 1) Daily reset of metrics at midnight
- * 2) Working hours tracking (8 AM to 6 PM)
- * 3) Date display
+ * 2) Working hours tracking (8 AM to 6 PM GMT+10)
+ * 3) Date display in Papua New Guinea timezone
  * 4) Previous day stats in separate tab
  */
 
@@ -21,9 +21,12 @@ const DATA_DIR = (process.env.DATA_DIR || "/data").trim();
 const TOKENS_FILE = path.join(DATA_DIR, "portalTokens.json");
 const DAILY_STATS_FILE = path.join(DATA_DIR, "dailyStats.json");
 
-// Working hours: 8 AM to 6 PM (in 24-hour format)
-const WORK_START_HOUR = 8; // 8 AM
-const WORK_END_HOUR = 18;  // 6 PM
+// Working hours: 8 AM to 6 PM in Papua New Guinea time (GMT+10)
+const WORK_START_HOUR = 8; // 8 AM in GMT+10
+const WORK_END_HOUR = 18;  // 6 PM in GMT+10
+
+// Papua New Guinea timezone
+const TIMEZONE = 'Pacific/Port_Moresby'; // GMT+10
 
 // In-memory state
 let portalTokens = {};
@@ -52,22 +55,30 @@ let previousDayStats = {
 const liveCalls = new Map();
 const agents = new Map();
 
-// -------------------- Helper Functions --------------------
-function getCurrentDate() {
+// -------------------- Timezone Helper Functions --------------------
+function getPNGTime() {
+  // Convert UTC to Papua New Guinea time (GMT+10)
   const now = new Date();
-  return now.toISOString().split('T')[0]; // YYYY-MM-DD format
+  const pngOffset = 10 * 60; // GMT+10 in minutes
+  const pngTime = new Date(now.getTime() + pngOffset * 60000);
+  return pngTime;
+}
+
+function getCurrentDate() {
+  const pngTime = getPNGTime();
+  return pngTime.toISOString().split('T')[0]; // YYYY-MM-DD format
 }
 
 function getCurrentDateTime() {
-  return new Date().toISOString();
+  return getPNGTime().toISOString();
 }
 
 function checkIfWithinWorkHours() {
-  const now = new Date();
-  const hour = now.getHours();
-  const minute = now.getMinutes();
+  const pngTime = getPNGTime();
+  const hour = pngTime.getUTCHours(); // Using getUTCHours because we already added offset
+  const minute = pngTime.getUTCMinutes();
   
-  // Check if current time is between 8:00 AM and 6:00 PM
+  // Check if current time is between 8:00 AM and 6:00 PM PNG time
   const currentTimeInMinutes = hour * 60 + minute;
   const workStartInMinutes = WORK_START_HOUR * 60; // 8:00 AM = 480 minutes
   const workEndInMinutes = WORK_END_HOUR * 60;     // 6:00 PM = 1080 minutes
@@ -75,31 +86,72 @@ function checkIfWithinWorkHours() {
   return currentTimeInMinutes >= workStartInMinutes && currentTimeInMinutes < workEndInMinutes;
 }
 
-function formatTime(date) {
-  return date.toLocaleTimeString('en-US', { 
+function formatTimePNG(date) {
+  const pngTime = getPNGTime();
+  return pngTime.toLocaleTimeString('en-AU', { 
+    timeZone: 'Australia/Sydney', // Closest to PNG timezone
     hour: '2-digit', 
     minute: '2-digit',
     hour12: true 
   });
 }
 
+function formatDatePNG(date) {
+  const pngTime = getPNGTime();
+  return pngTime.toLocaleDateString('en-AU', { 
+    timeZone: 'Australia/Sydney',
+    weekday: 'long', 
+    year: 'numeric', 
+    month: 'long', 
+    day: 'numeric' 
+  });
+}
+
+function formatDateTimePNG(date) {
+  const pngTime = getPNGTime();
+  return {
+    date: pngTime.toLocaleDateString('en-AU', { 
+      timeZone: 'Australia/Sydney',
+      weekday: 'long', 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    }),
+    time: pngTime.toLocaleTimeString('en-AU', { 
+      timeZone: 'Australia/Sydney',
+      hour: '2-digit', 
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false 
+    })
+  };
+}
+
 function getWorkHoursStatus() {
-  const now = new Date();
-  const hour = now.getHours();
-  const minute = now.getMinutes();
+  const pngTime = getPNGTime();
+  const hour = pngTime.getUTCHours();
+  const minute = pngTime.getUTCMinutes();
   const isWorkHours = checkIfWithinWorkHours();
+  
+  // Log for debugging
+  console.log(`🌐 PNG Time: ${hour}:${minute.toString().padStart(2, '0')} (GMT+10)`);
+  console.log(`🏢 Work hours check: ${isWorkHours ? 'OPEN' : 'CLOSED'}`);
   
   if (isWorkHours) {
     const remainingMinutes = (WORK_END_HOUR * 60) - (hour * 60 + minute);
     const remainingHours = Math.floor(remainingMinutes / 60);
     const remainingMins = remainingMinutes % 60;
-    return `Open (Closes at 6:00 PM - ${remainingHours}h ${remainingMins}m remaining)`;
+    
+    // Format closing time
+    const closingTime = `${WORK_END_HOUR.toString().padStart(2, '0')}:00`;
+    
+    return `Open (Closes at ${closingTime} - ${remainingHours}h ${remainingMins}m remaining)`;
   } else {
     if (hour < WORK_START_HOUR) {
       const remainingMinutes = (WORK_START_HOUR * 60) - (hour * 60 + minute);
       const remainingHours = Math.floor(remainingMinutes / 60);
       const remainingMins = remainingMinutes % 60;
-      return `Closed (Opens at 8:00 AM - in ${remainingHours}h ${remainingMins}m)`;
+      return `Closed (Opens at 08:00 - in ${remainingHours}h ${remainingMins}m)`;
     } else {
       // Calculate time until tomorrow 8 AM
       const minutesUntilMidnight = (24 * 60) - (hour * 60 + minute);
@@ -107,7 +159,7 @@ function getWorkHoursStatus() {
       const remainingMinutes = minutesUntilMidnight + minutesFromMidnightTo8AM;
       const remainingHours = Math.floor(remainingMinutes / 60);
       const remainingMins = remainingMinutes % 60;
-      return `Closed (Opens at 8:00 AM - in ${remainingHours}h ${remainingMins}m)`;
+      return `Closed (Opens at 08:00 - in ${remainingHours}h ${remainingMins}m)`;
     }
   }
 }
@@ -310,14 +362,6 @@ function extractAgentName(data) {
     }
   }
   
-  // Log what fields are available for debugging
-  const availableFields = Object.keys(data).filter(key => 
-    typeof data[key] === 'string' && data[key].trim()
-  );
-  if (availableFields.length > 0) {
-    console.log(`🔍 Available fields in payload: ${availableFields.join(', ')}`);
-  }
-  
   return ""; // Return empty if not found
 }
 
@@ -371,9 +415,10 @@ setInterval(() => {
   dailyMetrics.isWithinWorkHours = checkIfWithinWorkHours();
 }, 30000);
 
-// Heartbeat
+// Heartbeat with PNG time
 setInterval(() => {
-  console.log("🫀 alive", new Date().toISOString());
+  const pngTime = getPNGTime();
+  console.log("🫀 alive", pngTime.toISOString(), "(GMT+10)");
 }, 30000);
 
 // -------------------- Routes --------------------
@@ -418,11 +463,6 @@ app.post("/bitrix/events", (req, res) => {
   
   console.log("📨 EVENT:", eventName);
   console.log("📊 Event data keys:", Object.keys(data).join(', '));
-  
-  // Log the entire payload for debugging
-  if (Object.keys(data).length > 0) {
-    console.log("📋 Full payload:", JSON.stringify(data, null, 2));
-  }
 
   const callId = data.CALL_ID || data.callId || data.id || data.ID || data.CALL_ID_EXTERNAL || data.EXTERNAL_CALL_ID || data.externalCallId;
 
@@ -431,9 +471,18 @@ app.post("/bitrix/events", (req, res) => {
     return;
   }
 
+  // Get PNG time for logging
+  const pngTime = getPNGTime();
+  const currentPNGTime = pngTime.toLocaleTimeString('en-AU', { 
+    timeZone: 'Australia/Sydney',
+    hour: '2-digit', 
+    minute: '2-digit',
+    hour12: false 
+  });
+
   // Only process calls during work hours
   if (!dailyMetrics.isWithinWorkHours) {
-    console.log(`⏰ Outside work hours (${formatTime(new Date())}), ignoring call ${callId}`);
+    console.log(`⏰ Outside work hours (${currentPNGTime} GMT+10), ignoring call ${callId}`);
     return;
   }
 
@@ -568,11 +617,17 @@ app.get("/debug/last-event", (req, res) => {
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.get("/debug/state", (req, res) => {
+  const pngDateTime = formatDateTimePNG();
+  
   res.json({
     ok: true,
     currentDate: dailyMetrics.date,
     isWithinWorkHours: dailyMetrics.isWithinWorkHours,
     workHoursStatus: getWorkHoursStatus(),
+    pngDateTime: {
+      date: pngDateTime.date,
+      time: pngDateTime.time
+    },
     dailyMetrics,
     previousDayStats,
     liveCalls: Array.from(liveCalls.entries()).map(([id, v]) => ({ 
@@ -596,18 +651,9 @@ app.get("/debug/daily-stats", (req, res) => {
 
 // -------------------- HTML Generation --------------------
 function getWallboardHtml(isYesterdayPage = false) {
-  const now = new Date();
-  const currentDate = now.toLocaleDateString('en-US', { 
-    weekday: 'long', 
-    year: 'numeric', 
-    month: 'long', 
-    day: 'numeric' 
-  });
-  const currentTime = now.toLocaleTimeString('en-US', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit'
-  });
+  const pngDateTime = formatDateTimePNG();
+  const currentDate = pngDateTime.date;
+  const currentTime = pngDateTime.time;
   
   if (isYesterdayPage) {
     return getYesterdayStatsHtml(currentDate, currentTime);
@@ -705,6 +751,10 @@ function getTodayWallboardHtml(currentDate, currentTime) {
     .work-hours.closed{
       background:rgba(255,77,77,.1); border-color:rgba(255,77,77,.3);
       color:#ff4d4d;
+    }
+    .timezone{
+      font-size:10px; color:var(--muted); opacity:0.7;
+      margin-left:4px;
     }
 
     .grid{
@@ -811,12 +861,12 @@ function getTodayWallboardHtml(currentDate, currentTime) {
           <div class="dot"></div>
           <div>
             <h1>Fincorp Contact Center Wallboard</h1>
-            <div class="sub">Live call activity • Auto-refresh • Working Hours: 8:00 AM - 6:00 PM</div>
+            <div class="sub">Live call activity • Auto-refresh • Working Hours: 8:00 AM - 6:00 PM (GMT+10)</div>
           </div>
         </div>
         <div class="date-time">
           <div class="date" id="currentDate">${currentDate}</div>
-          <div class="time" id="currentTime">${currentTime}</div>
+          <div class="time" id="currentTime">${currentTime} <span class="timezone">GMT+10</span></div>
           <div class="status">
             <span class="badge" id="badge"></span>
             <span id="connText">Connecting…</span>
@@ -995,18 +1045,8 @@ function getTodayWallboardHtml(currentDate, currentTime) {
   function safeText(v){ return (v === undefined || v === null) ? "" : String(v); }
 
   function updateDateTime(){
-    const now = new Date();
-    els.currentDate.textContent = now.toLocaleDateString('en-US', { 
-      weekday: 'long', 
-      year: 'numeric', 
-      month: 'long', 
-      day: 'numeric' 
-    });
-    els.currentTime.textContent = now.toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    });
+    // Time will be updated from server response
+    // We'll update it when we get fresh data from server
   }
 
   function renderCalls(liveCalls){
@@ -1060,6 +1100,12 @@ function getTodayWallboardHtml(currentDate, currentTime) {
       if(!r.ok) throw new Error("HTTP " + r.status);
       const s = await r.json();
 
+      // Update PNG date and time
+      if(s.pngDateTime){
+        els.currentDate.textContent = s.pngDateTime.date || "";
+        els.currentTime.textContent = (s.pngDateTime.time || "") + " <span class='timezone'>GMT+10</span>";
+      }
+
       // Update work hours status
       els.workHoursStatus.textContent = s.workHoursStatus || "";
       if(s.workHoursStatus && s.workHoursStatus.includes("Closed")) {
@@ -1101,10 +1147,6 @@ function getTodayWallboardHtml(currentDate, currentTime) {
     }
   }
 
-  // Update date/time every second
-  setInterval(updateDateTime, 1000);
-  updateDateTime();
-  
   poll();
   setInterval(poll, 1000);
 </script>
@@ -1168,6 +1210,10 @@ function getYesterdayStatsHtml(currentDate, currentTime) {
     .date, .time{display:flex; align-items:center; gap:6px;}
     .date:before{content:"📅";}
     .time:before{content:"🕒";}
+    .timezone{
+      font-size:10px; color:var(--muted); opacity:0.7;
+      margin-left:4px;
+    }
     .nav-tabs{
       display:flex; gap:8px; margin-top:12px;
     }
@@ -1279,12 +1325,12 @@ function getYesterdayStatsHtml(currentDate, currentTime) {
           <div class="dot"></div>
           <div>
             <h1>Fincorp Contact Center - Yesterday's Statistics</h1>
-            <div class="sub">Previous day call metrics and performance</div>
+            <div class="sub">Previous day call metrics and performance (GMT+10)</div>
           </div>
         </div>
         <div class="date-time">
           <div class="date" id="currentDate">${currentDate}</div>
-          <div class="time" id="currentTime">${currentTime}</div>
+          <div class="time" id="currentTime">${currentTime} <span class="timezone">GMT+10</span></div>
         </div>
       </div>
       
@@ -1350,8 +1396,8 @@ function getYesterdayStatsHtml(currentDate, currentTime) {
         <div style="margin-top:20px; padding:15px; background:rgba(0,0,0,.1); border-radius:8px; border:1px solid var(--border);">
           <div style="font-size:12px; color:var(--muted); margin-bottom:8px;">📊 Note:</div>
           <div style="font-size:11px; color:var(--muted);">
-            • Statistics are automatically saved at midnight and reset for the new day<br>
-            • Working hours: 8:00 AM - 6:00 PM<br>
+            • Statistics are automatically saved at midnight PNG time (GMT+10)<br>
+            • Working hours: 8:00 AM - 6:00 PM (GMT+10)<br>
             • Only calls during work hours are counted in the statistics
           </div>
         </div>
@@ -1364,26 +1410,17 @@ function getYesterdayStatsHtml(currentDate, currentTime) {
   </div>
 
 <script>
-  function updateDateTime(){
-    const now = new Date();
-    document.getElementById('currentDate').textContent = now.toLocaleDateString('en-US', { 
-      weekday: 'long', 
-      year: 'numeric', 
-      month: 'long', 
-      day: 'numeric' 
-    });
-    document.getElementById('currentTime').textContent = now.toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    });
-  }
-
   async function loadYesterdayStats(){
     try {
       const r = await fetch("/debug/state", { cache: "no-store" });
       if(!r.ok) throw new Error("HTTP " + r.status);
       const s = await r.json();
+      
+      // Update current date/time from PNG timezone
+      if(s.pngDateTime){
+        document.getElementById('currentDate').textContent = s.pngDateTime.date || "";
+        document.getElementById('currentTime').textContent = (s.pngDateTime.time || "") + " <span class='timezone'>GMT+10</span>";
+      }
       
       const stats = s.previousDayStats || {};
       
@@ -1412,10 +1449,6 @@ function getYesterdayStatsHtml(currentDate, currentTime) {
     }
   }
   
-  // Update date/time every second
-  setInterval(updateDateTime, 1000);
-  updateDateTime();
-  
   // Load stats on page load and every 30 seconds
   loadYesterdayStats();
   setInterval(loadYesterdayStats, 30000);
@@ -1427,12 +1460,17 @@ function getYesterdayStatsHtml(currentDate, currentTime) {
 // -------------------- Listen --------------------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on ${PORT}`);
-  console.log(`🕒 Working hours: ${WORK_START_HOUR}:00 - ${WORK_END_HOUR}:00`);
-  console.log(`📊 Daily stats will reset automatically at midnight`);
+  console.log(`🌐 Configured for Papua New Guinea timezone (GMT+10)`);
+  console.log(`🕒 Working hours: ${WORK_START_HOUR}:00 - ${WORK_END_HOUR}:00 (GMT+10)`);
   
-  // Log current work hours status
+  // Log current PNG time and status
+  const pngTime = getPNGTime();
+  const pngHour = pngTime.getUTCHours();
+  const pngMinute = pngTime.getUTCMinutes();
   const isWorkHours = checkIfWithinWorkHours();
   const status = getWorkHoursStatus();
-  console.log(`⏰ Current status: ${status}`);
+  
+  console.log(`⏰ Current PNG time: ${pngHour.toString().padStart(2, '0')}:${pngMinute.toString().padStart(2, '0')} (GMT+10)`);
+  console.log(`🏢 Contact Center status: ${status}`);
   console.log(`📞 Calls will ${isWorkHours ? 'be processed' : 'NOT be processed (outside work hours)'}`);
 });
