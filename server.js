@@ -65,7 +65,14 @@ function getCurrentDateTime() {
 function checkIfWithinWorkHours() {
   const now = new Date();
   const hour = now.getHours();
-  return hour >= WORK_START_HOUR && hour < WORK_END_HOUR;
+  const minute = now.getMinutes();
+  
+  // Check if current time is between 8:00 AM and 6:00 PM
+  const currentTimeInMinutes = hour * 60 + minute;
+  const workStartInMinutes = WORK_START_HOUR * 60; // 8:00 AM = 480 minutes
+  const workEndInMinutes = WORK_END_HOUR * 60;     // 6:00 PM = 1080 minutes
+  
+  return currentTimeInMinutes >= workStartInMinutes && currentTimeInMinutes < workEndInMinutes;
 }
 
 function formatTime(date) {
@@ -79,21 +86,28 @@ function formatTime(date) {
 function getWorkHoursStatus() {
   const now = new Date();
   const hour = now.getHours();
+  const minute = now.getMinutes();
   const isWorkHours = checkIfWithinWorkHours();
   
   if (isWorkHours) {
-    const remainingHours = WORK_END_HOUR - hour - 1;
-    const remainingMinutes = 59 - now.getMinutes();
-    return `Open (Closes at 6:00 PM - ${remainingHours}h ${remainingMinutes}m remaining)`;
+    const remainingMinutes = (WORK_END_HOUR * 60) - (hour * 60 + minute);
+    const remainingHours = Math.floor(remainingMinutes / 60);
+    const remainingMins = remainingMinutes % 60;
+    return `Open (Closes at 6:00 PM - ${remainingHours}h ${remainingMins}m remaining)`;
   } else {
     if (hour < WORK_START_HOUR) {
-      const nextHour = WORK_START_HOUR - hour - 1;
-      const nextMinutes = 59 - now.getMinutes();
-      return `Closed (Opens at 8:00 AM - in ${nextHour}h ${nextMinutes}m)`;
+      const remainingMinutes = (WORK_START_HOUR * 60) - (hour * 60 + minute);
+      const remainingHours = Math.floor(remainingMinutes / 60);
+      const remainingMins = remainingMinutes % 60;
+      return `Closed (Opens at 8:00 AM - in ${remainingHours}h ${remainingMins}m)`;
     } else {
-      const nextHour = (24 - hour) + WORK_START_HOUR - 1;
-      const nextMinutes = 59 - now.getMinutes();
-      return `Closed (Opens at 8:00 AM - in ${nextHour}h ${nextMinutes}m)`;
+      // Calculate time until tomorrow 8 AM
+      const minutesUntilMidnight = (24 * 60) - (hour * 60 + minute);
+      const minutesFromMidnightTo8AM = WORK_START_HOUR * 60;
+      const remainingMinutes = minutesUntilMidnight + minutesFromMidnightTo8AM;
+      const remainingHours = Math.floor(remainingMinutes / 60);
+      const remainingMins = remainingMinutes % 60;
+      return `Closed (Opens at 8:00 AM - in ${remainingHours}h ${remainingMins}m)`;
     }
   }
 }
@@ -260,7 +274,10 @@ function extractCallerNumber(data) {
   
   for (const field of possibleFields) {
     if (data[field] && data[field].toString().trim()) {
-      return data[field].toString().trim();
+      // Extract only digits from the phone number
+      const rawNumber = data[field].toString().trim();
+      const digitsOnly = rawNumber.replace(/\D/g, '');
+      return digitsOnly || rawNumber; // Return digits only if found, otherwise raw
     }
   }
   
@@ -268,18 +285,40 @@ function extractCallerNumber(data) {
 }
 
 function extractAgentName(data) {
+  // Bitrix24 typically sends user info in these fields
   const possibleFields = [
-    'USER_NAME', 'USER_FULL_NAME', 'USER', 'AGENT_NAME', 
-    'AGENT_FULL_NAME', 'agentName', 'agent_name', 'FULL_NAME', 'fullName', 'NAME', 'name'
+    'USER_NAME',        // Bitrix user name
+    'USER_FULL_NAME',   // Bitrix full name
+    'USER',             // Sometimes just USER
+    'AGENT_NAME',       // Alternative field
+    'AGENT_FULL_NAME',  // Alternative full name
+    'agentName',        // lowercase variant
+    'agent_name',       // snake_case variant
+    'FULL_NAME',        // Generic full name
+    'fullName',         // camelCase variant
+    'NAME',             // Simple name
+    'name',             // lowercase name
+    'PORTAL_USER_NAME', // Portal user name
+    'PORTAL_USER_FULL_NAME' // Portal user full name
   ];
   
   for (const field of possibleFields) {
     if (data[field] && data[field].toString().trim()) {
-      return data[field].toString().trim();
+      const name = data[field].toString().trim();
+      console.log(`👤 Extracted agent name from field '${field}': ${name}`);
+      return name;
     }
   }
   
-  return "";
+  // Log what fields are available for debugging
+  const availableFields = Object.keys(data).filter(key => 
+    typeof data[key] === 'string' && data[key].trim()
+  );
+  if (availableFields.length > 0) {
+    console.log(`🔍 Available fields in payload: ${availableFields.join(', ')}`);
+  }
+  
+  return ""; // Return empty if not found
 }
 
 function extractAgentId(data) {
@@ -290,7 +329,9 @@ function extractAgentId(data) {
   
   for (const field of possibleFields) {
     if (data[field] && data[field].toString().trim()) {
-      return data[field].toString().trim();
+      const id = data[field].toString().trim();
+      console.log(`🔢 Extracted agent ID from field '${field}': ${id}`);
+      return id;
     }
   }
   
@@ -374,6 +415,15 @@ app.post("/bitrix/events", (req, res) => {
   
   const eventName = pickEventName(req.body);
   const data = pickEventData(req.body);
+  
+  console.log("📨 EVENT:", eventName);
+  console.log("📊 Event data keys:", Object.keys(data).join(', '));
+  
+  // Log the entire payload for debugging
+  if (Object.keys(data).length > 0) {
+    console.log("📋 Full payload:", JSON.stringify(data, null, 2));
+  }
+
   const callId = data.CALL_ID || data.callId || data.id || data.ID || data.CALL_ID_EXTERNAL || data.EXTERNAL_CALL_ID || data.externalCallId;
 
   if (!callId) {
@@ -414,20 +464,30 @@ app.post("/bitrix/events", (req, res) => {
     else dailyMetrics.outgoing.inProgress += 1;
   }
 
+  // Update with latest info
   if (from) lc.from = from;
   if (to) lc.to = to;
   if (direction) lc.direction = direction;
+  
+  // Update agent info - prioritize new info from event
   if (agentId) {
     lc.agentId = String(agentId);
-    if (agentName) lc.agentName = agentName;
   }
+  if (agentName) {
+    lc.agentName = agentName;
+  }
+  
   lc.status = String(status);
 
+  // Update agent state (if we have agent)
   if (lc.agentId) {
     const a = ensureAgent(lc.agentId, lc.agentName || agentName);
     a.onCallNow = !isEndEvent(eventName);
+    
+    // Update agent name from the call data if available
     if (lc.agentName && a.name !== lc.agentName) {
       a.name = lc.agentName;
+      console.log(`📝 Updated agent ${lc.agentId} name to: ${lc.agentName}`);
     }
   }
 
@@ -439,6 +499,14 @@ app.post("/bitrix/events", (req, res) => {
   if (isStartEvent(eventName)) {
     lc.status = "ANSWERED";
     lc.wasAnswered = true;
+    
+    // Make sure we have the agent info from this event
+    if (agentId && !lc.agentId) {
+      lc.agentId = String(agentId);
+    }
+    if (agentName && !lc.agentName) {
+      lc.agentName = agentName;
+    }
     
     console.log(`✅ Call ${callId} answered by ${lc.agentName || `Agent ${lc.agentId}` || 'Unknown'}`);
     
@@ -761,7 +829,6 @@ function getTodayWallboardHtml(currentDate, currentTime) {
       <div class="nav-tabs">
         <a href="/wallboard" class="nav-tab active">Today's Activity</a>
         <a href="/wallboard/yesterday" class="nav-tab">Yesterday's Stats</a>
-        <a href="/debug/state" class="nav-tab" target="_blank">Debug</a>
       </div>
     </div>
   </div>
@@ -1224,7 +1291,6 @@ function getYesterdayStatsHtml(currentDate, currentTime) {
       <div class="nav-tabs">
         <a href="/wallboard" class="nav-tab">Today's Activity</a>
         <a href="/wallboard/yesterday" class="nav-tab active">Yesterday's Stats</a>
-        <a href="/debug/state" class="nav-tab" target="_blank">Debug</a>
       </div>
     </div>
   </div>
@@ -1363,4 +1429,10 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on ${PORT}`);
   console.log(`🕒 Working hours: ${WORK_START_HOUR}:00 - ${WORK_END_HOUR}:00`);
   console.log(`📊 Daily stats will reset automatically at midnight`);
+  
+  // Log current work hours status
+  const isWorkHours = checkIfWithinWorkHours();
+  const status = getWorkHoursStatus();
+  console.log(`⏰ Current status: ${status}`);
+  console.log(`📞 Calls will ${isWorkHours ? 'be processed' : 'NOT be processed (outside work hours)'}`);
 });
