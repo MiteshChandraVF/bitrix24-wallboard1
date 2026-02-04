@@ -1103,7 +1103,7 @@ function getTodayWallboardHtml(currentDate, currentTime) {
       // Update PNG date and time
       if(s.pngDateTime){
         els.currentDate.textContent = s.pngDateTime.date || "";
-        els.currentTime.textContent = (s.pngDateTime.time || "") + " <span class='timezone'>GMT+10</span>";
+        els.currentTime.textContent = (s.pngDateTime.time || "");
       }
 
       // Update work hours status
@@ -1419,7 +1419,7 @@ function getYesterdayStatsHtml(currentDate, currentTime) {
       // Update current date/time from PNG timezone
       if(s.pngDateTime){
         document.getElementById('currentDate').textContent = s.pngDateTime.date || "";
-        document.getElementById('currentTime').textContent = (s.pngDateTime.time || "") + " <span class='timezone'>GMT+10</span>";
+        document.getElementById('currentTime').textContent = (s.pngDateTime.time || "") ;
       }
       
       const stats = s.previousDayStats || {};
