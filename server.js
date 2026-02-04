@@ -1,21 +1,11 @@
 /**
  * server.js — Bitrix24 Wallboard Backend (Railway)
  * ------------------------------------------------
- * Key fixes included:
- * 1) ✅ NO event.bind from backend (prevents WRONG_AUTH_TYPE 403)
- * - Outbound Webhook in Bitrix handles event delivery to /bitrix/events
- *
- * 2) ✅ Stable storage for tokens/portals using Railway Volume
- * - DATA_DIR=/data (Railway service variable)
- *
- * 3) ✅ /bitrix/events accepts ONLY POST (Bitrix outbound webhook)
- * - Logs inbound webhook payload
- * - Normalizes event names to UPPERCASE and supports CamelCase too
- *
- * 4) ✅ Debug endpoints:
- * - /health
- * - /debug/state
- * - /debug/last-events (optional)
+ * Key features:
+ * 1) Daily reset of metrics at midnight
+ * 2) Working hours tracking (8 AM to 6 PM)
+ * 3) Date display
+ * 4) Previous day stats in separate tab
  */
 
 "use strict";
@@ -26,60 +16,159 @@ const express = require("express");
 
 // -------------------- Config --------------------
 const PORT = parseInt(process.env.PORT || "3000", 10);
-
-// PUBLIC_URL should be your Railway public domain (HTTPS)
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").trim();
-
-// Persist tokens/portal info
 const DATA_DIR = (process.env.DATA_DIR || "/data").trim();
 const TOKENS_FILE = path.join(DATA_DIR, "portalTokens.json");
+const DAILY_STATS_FILE = path.join(DATA_DIR, "dailyStats.json");
 
-// Optional: Outbound webhook token (if you want to validate source)
-const BITRIX_OUTBOUND_TOKEN = (process.env.BITRIX_OUTBOUND_TOKEN || "").trim();
+// Working hours: 8 AM to 6 PM (in 24-hour format)
+const WORK_START_HOUR = 8; // 8 AM
+const WORK_END_HOUR = 18;  // 6 PM
 
 // In-memory state
-let portalTokens = {}; // stored in TOKENS_FILE
-const lastEvents = []; // keep last N webhook events for debugging
+let portalTokens = {};
+const lastEvents = [];
 
-// Example metrics state (you can replace with your own structure)
-const metrics = {
+// Daily metrics (reset daily)
+let dailyMetrics = {
+  date: getCurrentDate(),
+  isWithinWorkHours: checkIfWithinWorkHours(),
   incoming: { inProgress: 0, answered: 0, missed: 0 },
   outgoing: { inProgress: 0, answered: 0, cancelled: 0 },
   missedDroppedAbandoned: 0,
+  startedAt: new Date().toISOString(),
+  lastReset: new Date().toISOString()
 };
-const liveCalls = new Map(); // callId -> {direction, agentId, wasAnswered, ...}
-const agents = new Map(); // agentId -> { onCallNow, inboundMissed, outboundMissed, ... }
-function pickEventName(body) {
-  return (
-    body?.event ||
-    body?.EVENT ||
-    body?.type ||
-    body?.TYPE ||
-    body?.eventName ||
-    "unknown"
-  );
+
+// Previous day stats (loaded from file)
+let previousDayStats = {
+  date: "",
+  incoming: { answered: 0, missed: 0 },
+  outgoing: { answered: 0, cancelled: 0 },
+  missedDroppedAbandoned: 0,
+  totalCalls: 0
+};
+
+const liveCalls = new Map();
+const agents = new Map();
+
+// -------------------- Helper Functions --------------------
+function getCurrentDate() {
+  const now = new Date();
+  return now.toISOString().split('T')[0]; // YYYY-MM-DD format
 }
 
-function pickEventData(body) {
-  return body?.data || body?.DATA || body?.payload || body?.PAYLOAD || {};
+function getCurrentDateTime() {
+  return new Date().toISOString();
 }
 
-// Bitrix outbound webhooks use event names like:
-// ONVOXIMPLANTCALLINIT, ONVOXIMPLANTCALLSTART, ONVOXIMPLANTCALLEND
-function isInitEvent(e) {
-  const x = String(e || "").toUpperCase();
-  return x.includes("ONVOXIMPLANTCALLINIT") || x.includes("CALLINIT");
-}
-function isStartEvent(e) {
-  const x = String(e || "").toUpperCase();
-  return x.includes("ONVOXIMPLANTCALLSTART") || x.includes("CALLSTART");
-}
-function isEndEvent(e) {
-  const x = String(e || "").toUpperCase();
-  return x.includes("ONVOXIMPLANTCALLEND") || x.includes("CALLEND");
+function checkIfWithinWorkHours() {
+  const now = new Date();
+  const hour = now.getHours();
+  return hour >= WORK_START_HOUR && hour < WORK_END_HOUR;
 }
 
-// -------------------- Helpers --------------------
+function formatTime(date) {
+  return date.toLocaleTimeString('en-US', { 
+    hour: '2-digit', 
+    minute: '2-digit',
+    hour12: true 
+  });
+}
+
+function getWorkHoursStatus() {
+  const now = new Date();
+  const hour = now.getHours();
+  const isWorkHours = checkIfWithinWorkHours();
+  
+  if (isWorkHours) {
+    const remainingHours = WORK_END_HOUR - hour - 1;
+    const remainingMinutes = 59 - now.getMinutes();
+    return `Open (Closes at 6:00 PM - ${remainingHours}h ${remainingMinutes}m remaining)`;
+  } else {
+    if (hour < WORK_START_HOUR) {
+      const nextHour = WORK_START_HOUR - hour - 1;
+      const nextMinutes = 59 - now.getMinutes();
+      return `Closed (Opens at 8:00 AM - in ${nextHour}h ${nextMinutes}m)`;
+    } else {
+      const nextHour = (24 - hour) + WORK_START_HOUR - 1;
+      const nextMinutes = 59 - now.getMinutes();
+      return `Closed (Opens at 8:00 AM - in ${nextHour}h ${nextMinutes}m)`;
+    }
+  }
+}
+
+function loadDailyStats() {
+  try {
+    ensureDir(DATA_DIR);
+    if (!fs.existsSync(DAILY_STATS_FILE)) return {};
+    const raw = fs.readFileSync(DAILY_STATS_FILE, "utf8");
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    console.error("❌ Failed to load daily stats:", e);
+    return {};
+  }
+}
+
+function saveDailyStats(stats) {
+  try {
+    ensureDir(DATA_DIR);
+    fs.writeFileSync(DAILY_STATS_FILE, JSON.stringify(stats, null, 2), "utf8");
+  } catch (e) {
+    console.error("❌ Failed to save daily stats:", e);
+  }
+}
+
+function checkAndResetDailyMetrics() {
+  const currentDate = getCurrentDate();
+  
+  if (dailyMetrics.date !== currentDate) {
+    console.log(`🔄 Resetting daily metrics for ${currentDate}`);
+    
+    // Save yesterday's stats
+    const yesterdayStats = {
+      date: dailyMetrics.date,
+      incoming: { 
+        answered: dailyMetrics.incoming.answered,
+        missed: dailyMetrics.incoming.missed
+      },
+      outgoing: { 
+        answered: dailyMetrics.outgoing.answered,
+        cancelled: dailyMetrics.outgoing.cancelled
+      },
+      missedDroppedAbandoned: dailyMetrics.missedDroppedAbandoned,
+      totalCalls: dailyMetrics.incoming.answered + dailyMetrics.incoming.missed + 
+                  dailyMetrics.outgoing.answered + dailyMetrics.outgoing.cancelled,
+      endedAt: new Date().toISOString()
+    };
+    
+    // Load existing stats and save
+    const allStats = loadDailyStats();
+    allStats[dailyMetrics.date] = yesterdayStats;
+    saveDailyStats(allStats);
+    
+    // Load previous day stats
+    previousDayStats = yesterdayStats;
+    
+    // Reset daily metrics
+    dailyMetrics = {
+      date: currentDate,
+      isWithinWorkHours: checkIfWithinWorkHours(),
+      incoming: { inProgress: 0, answered: 0, missed: 0 },
+      outgoing: { inProgress: 0, answered: 0, cancelled: 0 },
+      missedDroppedAbandoned: 0,
+      startedAt: new Date().toISOString(),
+      lastReset: new Date().toISOString()
+    };
+    
+    // Reset agent daily stats but keep their IDs/names
+    for (const agent of agents.values()) {
+      agent.inboundMissed = 0;
+      agent.outboundMissed = 0;
+    }
+  }
+}
+
 function ensureDir(dir) {
   try {
     fs.mkdirSync(dir, { recursive: true });
@@ -109,19 +198,34 @@ function saveTokens(obj) {
   }
 }
 
-function pushLastEvent(evt) {
-  lastEvents.unshift(evt);
-  while (lastEvents.length > 25) lastEvents.pop();
+function pickEventName(body) {
+  return (
+    body?.event ||
+    body?.EVENT ||
+    body?.type ||
+    body?.TYPE ||
+    body?.eventName ||
+    "unknown"
+  );
 }
 
-function normalizeEventName(raw) {
-  const s = String(raw || "").trim();
-  if (!s) return "UNKNOWN";
+function pickEventData(body) {
+  return body?.data || body?.DATA || body?.payload || body?.PAYLOAD || {};
+}
 
-  // Many Bitrix outbound webhooks arrive like: ONVOXIMPLANTCALLINIT
-  // Some older code may send: OnVoximplantCallInit
-  // Normalize to uppercase token for comparisons:
-  return s.toUpperCase();
+function isInitEvent(e) {
+  const x = String(e || "").toUpperCase();
+  return x.includes("ONVOXIMPLANTCALLINIT") || x.includes("CALLINIT");
+}
+
+function isStartEvent(e) {
+  const x = String(e || "").toUpperCase();
+  return x.includes("ONVOXIMPLANTCALLSTART") || x.includes("CALLSTART");
+}
+
+function isEndEvent(e) {
+  const x = String(e || "").toUpperCase();
+  return x.includes("ONVOXIMPLANTCALLEND") || x.includes("CALLEND");
 }
 
 function clampDown(obj, key) {
@@ -141,7 +245,6 @@ function ensureAgent(agentId, agentName = "") {
       outboundMissed: 0,
     });
   } else if (agentName && agentName !== agents.get(agentId).name) {
-    // Update agent name if provided and different
     const agent = agents.get(agentId);
     agent.name = agentName;
   }
@@ -149,22 +252,10 @@ function ensureAgent(agentId, agentName = "") {
   return agents.get(agentId);
 }
 
-// Function to extract caller number from various payload formats
 function extractCallerNumber(data) {
-  // Try different possible fields for caller number
   const possibleFields = [
-    'PHONE_NUMBER',
-    'CALLER_ID',
-    'CALLER',
-    'FROM_NUMBER',
-    'FROM',
-    'from',
-    'phoneNumber',
-    'phone',
-    'PHONE',
-    'NUMBER',
-    'number',
-    'CALLER_NUMBER'
+    'PHONE_NUMBER', 'CALLER_ID', 'CALLER', 'FROM_NUMBER', 'FROM', 
+    'from', 'phoneNumber', 'phone', 'PHONE', 'NUMBER', 'number', 'CALLER_NUMBER'
   ];
   
   for (const field of possibleFields) {
@@ -173,24 +264,13 @@ function extractCallerNumber(data) {
     }
   }
   
-  return ""; // Return empty if not found
+  return "";
 }
 
-// Function to extract agent/user name from payload
 function extractAgentName(data) {
-  // Try different possible fields for agent name
   const possibleFields = [
-    'USER_NAME',
-    'USER_FULL_NAME',
-    'USER',
-    'AGENT_NAME',
-    'AGENT_FULL_NAME',
-    'agentName',
-    'agent_name',
-    'FULL_NAME',
-    'fullName',
-    'NAME',
-    'name'
+    'USER_NAME', 'USER_FULL_NAME', 'USER', 'AGENT_NAME', 
+    'AGENT_FULL_NAME', 'agentName', 'agent_name', 'FULL_NAME', 'fullName', 'NAME', 'name'
   ];
   
   for (const field of possibleFields) {
@@ -199,21 +279,13 @@ function extractAgentName(data) {
     }
   }
   
-  return ""; // Return empty if not found
+  return "";
 }
 
-// Function to extract agent ID from payload
 function extractAgentId(data) {
-  // Try different possible fields for agent ID
   const possibleFields = [
-    'USER_ID',
-    'PORTAL_USER_ID',
-    'AGENT_ID',
-    'agentId',
-    'agent_id',
-    'USER',
-    'user',
-    'userId'
+    'USER_ID', 'PORTAL_USER_ID', 'AGENT_ID', 
+    'agentId', 'agent_id', 'USER', 'user', 'userId'
   ];
   
   for (const field of possibleFields) {
@@ -227,48 +299,53 @@ function extractAgentId(data) {
 
 // -------------------- App --------------------
 const app = express();
-
-// Bitrix outbound webhook often sends application/x-www-form-urlencoded
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "2mb" }));
 
-// Simple "alive" heartbeat in logs (helps confirm container not sleeping)
+// Initialize
+console.log("🚀 Boot");
+portalTokens = loadTokens();
+
+// Load previous day stats
+const allStats = loadDailyStats();
+const yesterday = new Date();
+yesterday.setDate(yesterday.getDate() - 1);
+const yesterdayDate = yesterday.toISOString().split('T')[0];
+if (allStats[yesterdayDate]) {
+  previousDayStats = allStats[yesterdayDate];
+}
+
+// Check and reset metrics on startup
+checkAndResetDailyMetrics();
+
+// Schedule daily reset check every minute
+setInterval(() => {
+  checkAndResetDailyMetrics();
+  // Update work hours status
+  dailyMetrics.isWithinWorkHours = checkIfWithinWorkHours();
+}, 60000);
+
+// Update work hours status periodically
+setInterval(() => {
+  dailyMetrics.isWithinWorkHours = checkIfWithinWorkHours();
+}, 30000);
+
+// Heartbeat
 setInterval(() => {
   console.log("🫀 alive", new Date().toISOString());
-}, 30_000);
+}, 30000);
 
-// Boot logs
-console.log("🚀 Boot");
-console.log("💾 Tokens file:", TOKENS_FILE);
-portalTokens = loadTokens();
-console.log("🔑 Tokens loaded:", Object.keys(portalTokens).length);
-
-const handlerUrl =
-  PUBLIC_URL && PUBLIC_URL.startsWith("http")
-    ? `${PUBLIC_URL.replace(/\/+$/, "")}/bitrix/events`
-    : "(set PUBLIC_URL to show handler)";
-console.log("🔗 Handler URL:", handlerUrl);
-
-// Root
+// -------------------- Routes --------------------
 app.get("/", (req, res) => {
   res.type("text/plain").send("Bitrix24 Wallboard Backend is running.");
 });
 
-// -------------------- INSTALL ENDPOINT --------------------
-// NOTE: We do NOT event.bind here.
-// Outbound Webhook in Bitrix UI pushes events to /bitrix/events.
 app.post("/bitrix/install", (req, res) => {
   try {
-    console.log("🔧 INSTALL content-type:", req.headers["content-type"]);
-    console.log("🔧 INSTALL query keys:", Object.keys(req.query || {}));
-    console.log("🔧 INSTALL body keys:", Object.keys(req.body || {}));
-
-    const domain =
-      req.query.DOMAIN || req.body.DOMAIN || req.body.domain || "unknown-domain";
-    const memberId =
-      req.body.member_id || req.body.MEMBER_ID || "unknown-member";
-
+    const domain = req.query.DOMAIN || req.body.DOMAIN || req.body.domain || "unknown-domain";
+    const memberId = req.body.member_id || req.body.MEMBER_ID || "unknown-member";
     const key = `${domain}|${memberId}`;
+    
     portalTokens[key] = {
       domain,
       memberId,
@@ -277,13 +354,10 @@ app.post("/bitrix/install", (req, res) => {
 
     saveTokens(portalTokens);
     console.log("✅ INSTALL stored portal key:", key);
-    console.log("💾 Tokens saved to:", TOKENS_FILE);
 
     return res.json({
       ok: true,
-      message:
-        "Installed OK. Configure Bitrix Outbound Webhook to POST events to /bitrix/events.",
-      handler: handlerUrl,
+      message: "Installed OK. Configure Bitrix Outbound Webhook to POST events to /bitrix/events.",
     });
   } catch (e) {
     console.error("❌ INSTALL error:", e);
@@ -295,68 +369,32 @@ app.post("/bitrix/install", (req, res) => {
 let lastEvent = null;
 
 app.post("/bitrix/events", (req, res) => {
-  // Respond fast
   res.json({ ok: true });
-
-  // Keep a copy for debugging
   lastEvent = req.body;
   
   const eventName = pickEventName(req.body);
   const data = pickEventData(req.body);
-
-  console.log("📨 EVENT:", eventName, "| keys:", Object.keys(data || {}));
-  console.log("📊 Event data:", JSON.stringify(data, null, 2));
-
-  // Extract call id + phone fields as best-effort across payload variations
-  const callId =
-    data.CALL_ID ||
-    data.callId ||
-    data.id ||
-    data.ID ||
-    data.CALL_ID_EXTERNAL ||
-    data.EXTERNAL_CALL_ID ||
-    data.externalCallId;
+  const callId = data.CALL_ID || data.callId || data.id || data.ID || data.CALL_ID_EXTERNAL || data.EXTERNAL_CALL_ID || data.externalCallId;
 
   if (!callId) {
-    console.log("⚠️ No CALL_ID found. Add /debug/last-event to inspect payload.");
+    console.log("⚠️ No CALL_ID found.");
     return;
   }
 
-  // Use helper functions to extract data
-  const from = extractCallerNumber(data);
-  const to =
-    data.LINE_NUMBER ||
-    data.LINE ||
-    data.TO ||
-    data.to ||
-    data.DESTINATION ||
-    data.destination ||
-    "";
+  // Only process calls during work hours
+  if (!dailyMetrics.isWithinWorkHours) {
+    console.log(`⏰ Outside work hours (${formatTime(new Date())}), ignoring call ${callId}`);
+    return;
+  }
 
-  // Extract agent info
+  const from = extractCallerNumber(data);
+  const to = data.LINE_NUMBER || data.LINE || data.TO || data.to || data.DESTINATION || data.destination || "";
   const agentId = extractAgentId(data);
   const agentName = extractAgentName(data);
+  const directionRaw = data.DIRECTION || data.direction || data.CALL_DIRECTION || data.callDirection || "";
+  const direction = String(directionRaw).toUpperCase().includes("OUT") ? "OUT" : "IN";
+  const status = data.STATUS || data.status || data.STATE || data.state || eventName;
 
-  // Direction (best effort)
-  const directionRaw =
-    data.DIRECTION ||
-    data.direction ||
-    data.CALL_DIRECTION ||
-    data.callDirection ||
-    "";
-
-  const direction =
-    String(directionRaw).toUpperCase().includes("OUT") ? "OUT" : "IN";
-
-  // Status/state fields (best effort)
-  const status =
-    data.STATUS ||
-    data.status ||
-    data.STATE ||
-    data.state ||
-    eventName;
-
-  // Ensure live call exists
   let lc = liveCalls.get(callId);
   if (!lc) {
     lc = {
@@ -365,146 +403,110 @@ app.post("/bitrix/events", (req, res) => {
       from,
       to,
       status: "INIT",
-      wasAnswered: false, // Track if call was ever answered
+      wasAnswered: false,
       agentId: null,
       agentName: "",
       startedAt: Date.now(),
     };
     liveCalls.set(callId, lc);
 
-    if (direction === "IN") metrics.incoming.inProgress += 1;
-    else metrics.outgoing.inProgress += 1;
+    if (direction === "IN") dailyMetrics.incoming.inProgress += 1;
+    else dailyMetrics.outgoing.inProgress += 1;
   }
 
-  // Update with latest info (don't overwrite non-empty values with empty)
   if (from) lc.from = from;
   if (to) lc.to = to;
   if (direction) lc.direction = direction;
-  
-  // Update agent info if available
   if (agentId) {
     lc.agentId = String(agentId);
-    if (agentName) {
-      lc.agentName = agentName;
-    }
+    if (agentName) lc.agentName = agentName;
   }
-  
   lc.status = String(status);
 
-  // Update agent state (if we have agent)
   if (lc.agentId) {
     const a = ensureAgent(lc.agentId, lc.agentName || agentName);
     a.onCallNow = !isEndEvent(eventName);
-    
-    // Update agent name from the call data if available
     if (lc.agentName && a.name !== lc.agentName) {
       a.name = lc.agentName;
     }
   }
 
-  // Interpret key call events (map Bitrix webhook event names)
   if (isInitEvent(eventName)) {
-    // still ringing/initial
     lc.status = "RINGING";
-    
-    // Log the incoming call details
     console.log(`📞 ${direction === 'IN' ? 'Inbound' : 'Outbound'} call ${callId}: ${from || 'Unknown'} → ${to || 'Unknown'}`);
   }
 
   if (isStartEvent(eventName)) {
-    // answered
     lc.status = "ANSWERED";
-    lc.wasAnswered = true; // Mark as answered
+    lc.wasAnswered = true;
     
-    // Log who answered the call
-    if (lc.agentId && lc.agentName) {
-      console.log(`✅ Call ${callId} answered by ${lc.agentName} (ID: ${lc.agentId})`);
-    } else if (lc.agentId) {
-      console.log(`✅ Call ${callId} answered by Agent ${lc.agentId}`);
-    } else {
-      console.log(`✅ Call ${callId} answered`);
-    }
+    console.log(`✅ Call ${callId} answered by ${lc.agentName || `Agent ${lc.agentId}` || 'Unknown'}`);
     
     if (lc.direction === "IN") {
-      metrics.incoming.answered += 1;
-      // Decrement inProgress when answered (call is now active)
-      clampDown(metrics.incoming, "inProgress");
+      dailyMetrics.incoming.answered += 1;
+      clampDown(dailyMetrics.incoming, "inProgress");
     } else {
-      metrics.outgoing.answered += 1;
-      // Decrement inProgress when answered (call is now active)
-      clampDown(metrics.outgoing, "inProgress");
+      dailyMetrics.outgoing.answered += 1;
+      clampDown(dailyMetrics.outgoing, "inProgress");
     }
   }
 
   if (isEndEvent(eventName)) {
-    // finished
     lc.status = "ENDED";
 
-    // Decrement inProgress if not already decremented (for unanswered calls)
-    if (!lc.wasAnswered) {
-      if (lc.direction === "IN") clampDown(metrics.incoming, "inProgress");
-      else clampDown(metrics.outgoing, "inProgress");
-    }
-
-    // Handle missed/cancelled calls (only if never answered)
     if (!lc.wasAnswered) {
       if (lc.direction === "IN") {
-        metrics.incoming.missed += 1;
-        metrics.missedDroppedAbandoned += 1;
+        clampDown(dailyMetrics.incoming, "inProgress");
+        dailyMetrics.incoming.missed += 1;
+        dailyMetrics.missedDroppedAbandoned += 1;
         if (lc.agentId) {
           const agent = ensureAgent(lc.agentId, lc.agentName);
           agent.inboundMissed += 1;
         }
       } else {
-        metrics.outgoing.cancelled += 1;
+        clampDown(dailyMetrics.outgoing, "inProgress");
+        dailyMetrics.outgoing.cancelled += 1;
         if (lc.agentId) {
           const agent = ensureAgent(lc.agentId, lc.agentName);
           agent.outboundMissed += 1;
         }
       }
-      
-      console.log(`❌ Call ${callId} ${lc.direction === 'IN' ? 'missed' : 'cancelled'} (never answered)`);
+      console.log(`❌ Call ${callId} ${lc.direction === 'IN' ? 'missed' : 'cancelled'}`);
     } else {
-      console.log(`📞 Call ${callId} ended (was answered)`);
+      console.log(`📞 Call ${callId} ended`);
     }
 
-    // agent no longer on call
     if (lc.agentId) ensureAgent(lc.agentId, lc.agentName).onCallNow = false;
-
-    // remove call from live list
     liveCalls.delete(callId);
   }
 });
 
-// Debug endpoint for last event
+// -------------------- Wallboard Pages --------------------
+app.get("/wallboard", (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(getWallboardHtml(false));
+});
+
+app.get("/wallboard/yesterday", (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(getWallboardHtml(true));
+});
+
+// -------------------- Debug Endpoints --------------------
 app.get("/debug/last-event", (req, res) => {
   res.json({ ok: true, lastEvent });
 });
 
-// ---------- WALLBOARD UI (HTML) ----------
-app.get("/wallboard", (req, res) => {
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(getWallboardHtml());
-});
-
-// Helpful message for GET on /bitrix/events
-app.get("/bitrix/events", (req, res) => {
-  res
-    .status(405)
-    .type("text/plain")
-    .send("Method Not Allowed. Use POST /bitrix/events");
-});
-
-// -------------------- Debug --------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.get("/debug/state", (req, res) => {
   res.json({
     ok: true,
-    portalsStored: Object.keys(portalTokens).length,
-    tokensFile: TOKENS_FILE,
-    handler: handlerUrl,
-    metrics,
+    currentDate: dailyMetrics.date,
+    isWithinWorkHours: dailyMetrics.isWithinWorkHours,
+    workHoursStatus: getWorkHoursStatus(),
+    dailyMetrics,
+    previousDayStats,
     liveCalls: Array.from(liveCalls.entries()).map(([id, v]) => ({ 
       callId: id, 
       direction: v.direction,
@@ -519,17 +521,40 @@ app.get("/debug/state", (req, res) => {
   });
 });
 
-app.get("/debug/last-events", (req, res) => {
-  res.json({ ok: true, count: lastEvents.length, lastEvents });
+app.get("/debug/daily-stats", (req, res) => {
+  const allStats = loadDailyStats();
+  res.json({ ok: true, allStats });
 });
 
-function getWallboardHtml() {
+// -------------------- HTML Generation --------------------
+function getWallboardHtml(isYesterdayPage = false) {
+  const now = new Date();
+  const currentDate = now.toLocaleDateString('en-US', { 
+    weekday: 'long', 
+    year: 'numeric', 
+    month: 'long', 
+    day: 'numeric' 
+  });
+  const currentTime = now.toLocaleTimeString('en-US', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+  
+  if (isYesterdayPage) {
+    return getYesterdayStatsHtml(currentDate, currentTime);
+  } else {
+    return getTodayWallboardHtml(currentDate, currentTime);
+  }
+}
+
+function getTodayWallboardHtml(currentDate, currentTime) {
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Fincorp Contact Center Wallboard</title>
+  <title>Fincorp Contact Center Wallboard - Today</title>
   <style>
     :root{
       --vodafone-red:#E60000;
@@ -559,8 +584,9 @@ function getWallboardHtml() {
       background: linear-gradient(180deg, rgba(11,15,20,.95), rgba(11,15,20,.78));
       backdrop-filter: blur(10px);
       border-bottom:1px solid var(--border);
+      padding:12px 0;
     }
-    .wrap{max-width:1280px; margin:0 auto; padding:18px 18px;}
+    .wrap{max-width:1280px; margin:0 auto; padding:0 18px;}
     .brand{
       display:flex; align-items:center; gap:12px; justify-content:space-between;
     }
@@ -572,6 +598,12 @@ function getWallboardHtml() {
     }
     h1{margin:0; font-size:18px; letter-spacing:.2px}
     .sub{margin:2px 0 0; color:var(--muted); font-size:12px}
+    .date-time{
+      display:flex; align-items:center; gap:20px; font-size:12px; color:var(--muted);
+    }
+    .date, .time{display:flex; align-items:center; gap:6px;}
+    .date:before{content:"📅";}
+    .time:before{content:"🕒";}
     .status{
       display:flex; align-items:center; gap:10px; font-size:12px; color:var(--muted);
       padding:8px 10px; border:1px solid var(--border); border-radius:999px;
@@ -581,6 +613,30 @@ function getWallboardHtml() {
       width:10px;height:10px;border-radius:50%;
       background:var(--warn);
       box-shadow:0 0 0 6px rgba(246,195,67,.10);
+    }
+    .nav-tabs{
+      display:flex; gap:8px; margin-top:12px;
+    }
+    .nav-tab{
+      padding:8px 16px; border:1px solid var(--border);
+      border-radius:8px; background:rgba(18,25,35,.55);
+      color:var(--muted); text-decoration:none; font-size:12px;
+      transition:all 0.2s;
+    }
+    .nav-tab:hover{
+      background:rgba(30,40,55,.7); color:var(--text);
+    }
+    .nav-tab.active{
+      background:var(--vodafone-red); color:white; border-color:var(--vodafone-red);
+    }
+    .work-hours{
+      padding:8px 12px; background:rgba(46,204,113,.1);
+      border:1px solid rgba(46,204,113,.3); border-radius:8px;
+      font-size:11px; color:#2ecc71; margin-left:auto;
+    }
+    .work-hours.closed{
+      background:rgba(255,77,77,.1); border-color:rgba(255,77,77,.3);
+      color:#ff4d4d;
     }
 
     .grid{
@@ -687,14 +743,25 @@ function getWallboardHtml() {
           <div class="dot"></div>
           <div>
             <h1>Fincorp Contact Center Wallboard</h1>
-            <div class="sub">Live call activity • Auto-refresh</div>
+            <div class="sub">Live call activity • Auto-refresh • Working Hours: 8:00 AM - 6:00 PM</div>
           </div>
         </div>
-        <div class="status">
-          <span class="badge" id="badge"></span>
-          <span id="connText">Connecting…</span>
-          <span class="mono" id="lastTs"></span>
+        <div class="date-time">
+          <div class="date" id="currentDate">${currentDate}</div>
+          <div class="time" id="currentTime">${currentTime}</div>
+          <div class="status">
+            <span class="badge" id="badge"></span>
+            <span id="connText">Connecting…</span>
+            <span class="mono" id="lastTs"></span>
+          </div>
+          <div class="work-hours" id="workHoursStatus"></div>
         </div>
+      </div>
+      
+      <div class="nav-tabs">
+        <a href="/wallboard" class="nav-tab active">Today's Activity</a>
+        <a href="/wallboard/yesterday" class="nav-tab">Yesterday's Stats</a>
+        <a href="/debug/state" class="nav-tab" target="_blank">Debug</a>
       </div>
     </div>
   </div>
@@ -702,8 +769,8 @@ function getWallboardHtml() {
   <div class="grid">
     <div class="card">
       <div class="card-h">
-        <strong>Call Metrics</strong>
-        <span class="pill">Source: /debug/state</span>
+        <strong>Today's Call Metrics</strong>
+        <span class="pill" id="todayDate"></span>
       </div>
       <div class="content">
         <div class="kpis">
@@ -715,17 +782,17 @@ function getWallboardHtml() {
           <div class="kpi good">
             <div class="label">Inbound • Answered</div>
             <div class="val" id="inAns">0</div>
-            <div class="meta">Answered inbound calls</div>
+            <div class="meta">Answered inbound calls today</div>
           </div>
           <div class="kpi red">
             <div class="label">Inbound • Missed</div>
             <div class="val" id="inMiss">0</div>
-            <div class="meta">Missed inbound calls</div>
+            <div class="meta">Missed inbound calls today</div>
           </div>
           <div class="kpi red">
             <div class="label">Missed/Dropped/Abandoned</div>
             <div class="val" id="mda">0</div>
-            <div class="meta">All missed-type totals</div>
+            <div class="meta">All missed-type totals today</div>
           </div>
         </div>
 
@@ -738,12 +805,12 @@ function getWallboardHtml() {
           <div class="kpi">
             <div class="label">Outbound • Answered</div>
             <div class="val" id="outAns">0</div>
-            <div class="meta">Answered outbound calls</div>
+            <div class="meta">Answered outbound calls today</div>
           </div>
           <div class="kpi">
             <div class="label">Outbound • Cancelled</div>
             <div class="val" id="outCan">0</div>
-            <div class="meta">Cancelled outbound calls</div>
+            <div class="meta">Cancelled outbound calls today</div>
           </div>
           <div class="kpi">
             <div class="label">Portals Stored</div>
@@ -815,6 +882,10 @@ function getWallboardHtml() {
     badge: document.getElementById("badge"),
     connText: document.getElementById("connText"),
     lastTs: document.getElementById("lastTs"),
+    currentDate: document.getElementById("currentDate"),
+    currentTime: document.getElementById("currentTime"),
+    workHoursStatus: document.getElementById("workHoursStatus"),
+    todayDate: document.getElementById("todayDate"),
     portals: document.getElementById("portals"),
     inProg: document.getElementById("inProg"),
     inAns: document.getElementById("inAns"),
@@ -855,6 +926,21 @@ function getWallboardHtml() {
   }
 
   function safeText(v){ return (v === undefined || v === null) ? "" : String(v); }
+
+  function updateDateTime(){
+    const now = new Date();
+    els.currentDate.textContent = now.toLocaleDateString('en-US', { 
+      weekday: 'long', 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    });
+    els.currentTime.textContent = now.toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+  }
 
   function renderCalls(liveCalls){
     const calls = Array.isArray(liveCalls) ? liveCalls : [];
@@ -907,8 +993,21 @@ function getWallboardHtml() {
       if(!r.ok) throw new Error("HTTP " + r.status);
       const s = await r.json();
 
-      // fill KPIs (your backend already returns these)
-      const m = s.metrics || {};
+      // Update work hours status
+      els.workHoursStatus.textContent = s.workHoursStatus || "";
+      if(s.workHoursStatus && s.workHoursStatus.includes("Closed")) {
+        els.workHoursStatus.classList.add("closed");
+        els.workHoursStatus.classList.remove("open");
+      } else {
+        els.workHoursStatus.classList.add("open");
+        els.workHoursStatus.classList.remove("closed");
+      }
+
+      // Update today's date
+      els.todayDate.textContent = "Today: " + (s.currentDate || "");
+
+      // fill KPIs from daily metrics
+      const m = s.dailyMetrics || {};
       const incoming = m.incoming || {};
       const outgoing = m.outgoing || {};
 
@@ -935,8 +1034,325 @@ function getWallboardHtml() {
     }
   }
 
+  // Update date/time every second
+  setInterval(updateDateTime, 1000);
+  updateDateTime();
+  
   poll();
   setInterval(poll, 1000);
+</script>
+</body>
+</html>`;
+}
+
+function getYesterdayStatsHtml(currentDate, currentTime) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Fincorp Contact Center - Yesterday's Stats</title>
+  <style>
+    :root{
+      --vodafone-red:#E60000;
+      --bg:#0b0f14;
+      --panel:#121923;
+      --panel2:#0f151e;
+      --text:#eaf0f7;
+      --muted:#9fb0c3;
+      --good:#2ecc71;
+      --bad:#ff4d4d;
+      --warn:#f6c343;
+      --border:rgba(255,255,255,.08);
+      --shadow: 0 12px 30px rgba(0,0,0,.35);
+      --radius: 16px;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial;
+      color:var(--text);
+      background: radial-gradient(1200px 600px at 20% 0%, rgba(230,0,0,.12), transparent 60%),
+                  radial-gradient(1000px 500px at 100% 20%, rgba(0,170,255,.12), transparent 55%),
+                  var(--bg);
+    }
+    .topbar{
+      position:sticky; top:0; z-index:5;
+      background: linear-gradient(180deg, rgba(11,15,20,.95), rgba(11,15,20,.78));
+      backdrop-filter: blur(10px);
+      border-bottom:1px solid var(--border);
+      padding:12px 0;
+    }
+    .wrap{max-width:1280px; margin:0 auto; padding:0 18px;}
+    .brand{
+      display:flex; align-items:center; gap:12px; justify-content:space-between;
+    }
+    .brand-left{display:flex; align-items:center; gap:12px;}
+    .dot{
+      width:12px;height:12px;border-radius:50%;
+      background:var(--vodafone-red);
+      box-shadow:0 0 0 6px rgba(230,0,0,.12);
+    }
+    h1{margin:0; font-size:18px; letter-spacing:.2px}
+    .sub{margin:2px 0 0; color:var(--muted); font-size:12px}
+    .date-time{
+      display:flex; align-items:center; gap:20px; font-size:12px; color:var(--muted);
+    }
+    .date, .time{display:flex; align-items:center; gap:6px;}
+    .date:before{content:"📅";}
+    .time:before{content:"🕒";}
+    .nav-tabs{
+      display:flex; gap:8px; margin-top:12px;
+    }
+    .nav-tab{
+      padding:8px 16px; border:1px solid var(--border);
+      border-radius:8px; background:rgba(18,25,35,.55);
+      color:var(--muted); text-decoration:none; font-size:12px;
+      transition:all 0.2s;
+    }
+    .nav-tab:hover{
+      background:rgba(30,40,55,.7); color:var(--text);
+    }
+    .nav-tab.active{
+      background:var(--vodafone-red); color:white; border-color:var(--vodafone-red);
+    }
+
+    .grid{
+      display:grid;
+      grid-template-columns: 1fr;
+      gap:14px;
+      padding:18px;
+      max-width:1280px;
+      margin:0 auto;
+    }
+
+    .card{
+      background: linear-gradient(180deg, rgba(18,25,35,.92), rgba(15,21,30,.85));
+      border:1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .card-h{
+      padding:14px 16px;
+      border-bottom:1px solid var(--border);
+      display:flex; justify-content:space-between; align-items:center;
+    }
+    .card-h strong{font-size:13px; letter-spacing:.2px}
+    .pill{
+      font-size:11px; color:var(--muted);
+      border:1px solid var(--border);
+      padding:6px 10px; border-radius:999px;
+      background: rgba(0,0,0,.15);
+    }
+    .content{padding:14px 16px;}
+
+    .kpis{
+      display:grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap:12px;
+      margin-bottom:20px;
+    }
+    @media(min-width:600px){
+      .kpis{grid-template-columns: repeat(4, 1fr);}
+    }
+    .kpi{
+      padding:12px;
+      border:1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(0,0,0,.12);
+      text-align:center;
+    }
+    .kpi .label{color:var(--muted); font-size:11px}
+    .kpi .val{font-size:32px; font-weight:700; margin-top:6px}
+    .kpi .meta{color:var(--muted); font-size:11px; margin-top:6px}
+    .kpi.red .val{color:var(--vodafone-red)}
+    .kpi.good .val{color:var(--good)}
+    
+    .summary{
+      background: rgba(0,0,0,.15);
+      border:1px solid var(--border);
+      border-radius: 14px;
+      padding:20px;
+      margin-top:20px;
+    }
+    .summary h3{margin:0 0 15px 0; color:var(--text); font-size:14px;}
+    .summary-grid{
+      display:grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap:15px;
+    }
+    @media(min-width:600px){
+      .summary-grid{grid-template-columns: repeat(4, 1fr);}
+    }
+    .summary-item{
+      text-align:center;
+    }
+    .summary-item .number{
+      font-size:24px; font-weight:bold; color:var(--text);
+      margin-bottom:5px;
+    }
+    .summary-item .label{
+      font-size:11px; color:var(--muted);
+    }
+    
+    .footer{
+      max-width:1280px; margin:0 auto; padding:0 18px 24px;
+      color:var(--muted); font-size:11px;
+    }
+    .muted{color:var(--muted)}
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="wrap">
+      <div class="brand">
+        <div class="brand-left">
+          <div class="dot"></div>
+          <div>
+            <h1>Fincorp Contact Center - Yesterday's Statistics</h1>
+            <div class="sub">Previous day call metrics and performance</div>
+          </div>
+        </div>
+        <div class="date-time">
+          <div class="date" id="currentDate">${currentDate}</div>
+          <div class="time" id="currentTime">${currentTime}</div>
+        </div>
+      </div>
+      
+      <div class="nav-tabs">
+        <a href="/wallboard" class="nav-tab">Today's Activity</a>
+        <a href="/wallboard/yesterday" class="nav-tab active">Yesterday's Stats</a>
+        <a href="/debug/state" class="nav-tab" target="_blank">Debug</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card-h">
+        <strong>Yesterday's Performance Summary</strong>
+        <span class="pill" id="yesterdayDate">Loading...</span>
+      </div>
+      <div class="content">
+        <div class="kpis">
+          <div class="kpi good">
+            <div class="label">Inbound Answered</div>
+            <div class="val" id="y-inAns">0</div>
+            <div class="meta">Inbound calls answered</div>
+          </div>
+          <div class="kpi red">
+            <div class="label">Inbound Missed</div>
+            <div class="val" id="y-inMiss">0</div>
+            <div class="meta">Inbound calls missed</div>
+          </div>
+          <div class="kpi good">
+            <div class="label">Outbound Answered</div>
+            <div class="val" id="y-outAns">0</div>
+            <div class="meta">Outbound calls answered</div>
+          </div>
+          <div class="kpi">
+            <div class="label">Outbound Cancelled</div>
+            <div class="val" id="y-outCan">0</div>
+            <div class="meta">Outbound calls cancelled</div>
+          </div>
+        </div>
+        
+        <div class="summary">
+          <h3>Overall Statistics</h3>
+          <div class="summary-grid">
+            <div class="summary-item">
+              <div class="number" id="totalCalls">0</div>
+              <div class="label">Total Calls</div>
+            </div>
+            <div class="summary-item">
+              <div class="number" id="totalAnswered">0</div>
+              <div class="label">Total Answered</div>
+            </div>
+            <div class="summary-item">
+              <div class="number" id="totalMissed">0</div>
+              <div class="label">Total Missed</div>
+            </div>
+            <div class="summary-item">
+              <div class="number" id="answerRate">0%</div>
+              <div class="label">Answer Rate</div>
+            </div>
+          </div>
+        </div>
+        
+        <div style="margin-top:20px; padding:15px; background:rgba(0,0,0,.1); border-radius:8px; border:1px solid var(--border);">
+          <div style="font-size:12px; color:var(--muted); margin-bottom:8px;">📊 Note:</div>
+          <div style="font-size:11px; color:var(--muted);">
+            • Statistics are automatically saved at midnight and reset for the new day<br>
+            • Working hours: 8:00 AM - 6:00 PM<br>
+            • Only calls during work hours are counted in the statistics
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div>Backend: <span class="mono">/health</span>, <span class="mono">/debug/state</span>, <span class="mono">/bitrix/events</span></div>
+  </div>
+
+<script>
+  function updateDateTime(){
+    const now = new Date();
+    document.getElementById('currentDate').textContent = now.toLocaleDateString('en-US', { 
+      weekday: 'long', 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    });
+    document.getElementById('currentTime').textContent = now.toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+  }
+
+  async function loadYesterdayStats(){
+    try {
+      const r = await fetch("/debug/state", { cache: "no-store" });
+      if(!r.ok) throw new Error("HTTP " + r.status);
+      const s = await r.json();
+      
+      const stats = s.previousDayStats || {};
+      
+      // Update date
+      document.getElementById('yesterdayDate').textContent = stats.date || "No data";
+      
+      // Update KPIs
+      document.getElementById('y-inAns').textContent = stats.incoming?.answered || 0;
+      document.getElementById('y-inMiss').textContent = stats.incoming?.missed || 0;
+      document.getElementById('y-outAns').textContent = stats.outgoing?.answered || 0;
+      document.getElementById('y-outCan').textContent = stats.outgoing?.cancelled || 0;
+      
+      // Calculate summary
+      const totalAnswered = (stats.incoming?.answered || 0) + (stats.outgoing?.answered || 0);
+      const totalMissed = (stats.incoming?.missed || 0) + (stats.outgoing?.cancelled || 0);
+      const totalCalls = totalAnswered + totalMissed;
+      const answerRate = totalCalls > 0 ? Math.round((totalAnswered / totalCalls) * 100) : 0;
+      
+      document.getElementById('totalCalls').textContent = totalCalls;
+      document.getElementById('totalAnswered').textContent = totalAnswered;
+      document.getElementById('totalMissed').textContent = totalMissed;
+      document.getElementById('answerRate').textContent = answerRate + '%';
+      
+    } catch(e) {
+      console.error("Failed to load yesterday stats:", e);
+    }
+  }
+  
+  // Update date/time every second
+  setInterval(updateDateTime, 1000);
+  updateDateTime();
+  
+  // Load stats on page load and every 30 seconds
+  loadYesterdayStats();
+  setInterval(loadYesterdayStats, 30000);
 </script>
 </body>
 </html>`;
@@ -945,4 +1361,6 @@ function getWallboardHtml() {
 // -------------------- Listen --------------------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on ${PORT}`);
+  console.log(`🕒 Working hours: ${WORK_START_HOUR}:00 - ${WORK_END_HOUR}:00`);
+  console.log(`📊 Daily stats will reset automatically at midnight`);
 });
